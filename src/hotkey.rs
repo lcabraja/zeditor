@@ -8,13 +8,25 @@ use std::sync::Arc;
 const KEY_CODE_E: u16 = 14;
 const NS_KEY_DOWN_MASK: u64 = 1 << 10;
 
+// NSWindowAnimationBehavior values
+const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
+
+// NSStatusBar thickness (for menu bar)
+const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
+
 /// Registers both global and local NSEvent monitors for Cmd+Shift+E.
-/// The callback toggles the NSWindow visibility.
+/// Also disables window animation and creates a status bar item.
 ///
 /// # Safety
 /// `ns_window` must be a valid NSWindow/NSPanel pointer that outlives the monitors.
 pub unsafe fn register_hotkey(ns_window: *mut Object) {
     let visible = Arc::new(AtomicBool::new(false));
+
+    // Disable window animation for instant show/hide
+    let _: () = msg_send![ns_window, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE];
+
+    // Create status bar item (menu bar icon)
+    create_status_item(ns_window, visible.clone());
 
     // Global monitor — fires when another app is focused
     {
@@ -60,6 +72,82 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
     }
 }
 
+unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
+    // Get the system status bar
+    let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
+
+    // Create a status item with variable length
+    let status_item: id = msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH];
+
+    // Get the button from the status item
+    let button: id = msg_send![status_item, button];
+
+    // Set the title to a simple "Z" character (or could use an SF Symbol)
+    use cocoa::foundation::NSString;
+    let title = NSString::alloc(nil).init_str("Z");
+    let _: () = msg_send![button, setTitle: title];
+
+    // Store the status item to prevent it from being released
+    // We'll use statics to keep references alive
+    let ns_window = ns_window as usize;
+    GLOBAL_STATUS_ITEM.store(status_item as usize, Ordering::SeqCst);
+    GLOBAL_WINDOW.store(ns_window, Ordering::SeqCst);
+    GLOBAL_VISIBLE.store(Box::into_raw(Box::new(visible)) as usize, Ordering::SeqCst);
+
+    // Set up click handling via NSButton's action
+    // We need to create an Objective-C object to receive the action
+    setup_status_button_action(button);
+}
+
+// Global state for the status item callback
+static GLOBAL_STATUS_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GLOBAL_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GLOBAL_VISIBLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn setup_status_button_action(button: id) {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Sel};
+
+    // Check if we already registered the class
+    let class_name = "ZeditorStatusTarget";
+    let existing = Class::get(class_name);
+
+    let target_class = if let Some(cls) = existing {
+        cls
+    } else {
+        // Create a new Objective-C class to handle the click
+        let superclass = Class::get("NSObject").unwrap();
+        let mut decl = ClassDecl::new(class_name, superclass).unwrap();
+
+        extern "C" fn handle_click(_self: &Object, _cmd: Sel, _sender: id) {
+            unsafe {
+                let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+                let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+                if !visible_ptr.is_null() {
+                    toggle_window(ns_window, &*visible_ptr);
+                }
+            }
+        }
+
+        decl.add_method(
+            sel!(statusItemClicked:),
+            handle_click as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.register()
+    };
+
+    // Create an instance of our target class
+    let target: id = msg_send![target_class, new];
+
+    // Set the button's target and action
+    let _: () = msg_send![button, setTarget: target];
+    let _: () = msg_send![button, setAction: sel!(statusItemClicked:)];
+
+    // Keep target alive
+    std::mem::forget(target);
+}
+
 unsafe fn is_cmd_shift_e(event: id) -> bool {
     let key_code: u16 = msg_send![event, keyCode];
     let modifier_flags: u64 = msg_send![event, modifierFlags];
@@ -68,7 +156,7 @@ unsafe fn is_cmd_shift_e(event: id) -> bool {
     key_code == KEY_CODE_E && cmd && shift
 }
 
-unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
+pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
         let _: () = msg_send![ns_window, orderOut: nil];
         visible.store(false, Ordering::SeqCst);
