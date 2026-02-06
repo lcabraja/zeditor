@@ -1,13 +1,19 @@
-use cocoa::appkit::NSEventModifierFlags;
 use cocoa::base::{id, nil};
 use cocoa::foundation::NSString;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const KEY_CODE_E: u16 = 14;
-const NS_KEY_DOWN_MASK: u64 = 1 << 10;
+// Carbon Event constants
+const K_VK_ANSI_E: u32 = 0x0E; // Virtual key code for 'E'
+const CMD_KEY: u32 = 1 << 8; // cmdKey modifier
+const SHIFT_KEY: u32 = 1 << 9; // shiftKey modifier
+const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962; // 'keyb'
+const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
+const K_EVENT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D2D2D; // '----'
+const TYPE_EVENT_HOT_KEY_ID: u32 = 0x686B6964; // 'hkid'
 
 // NSWindowAnimationBehavior values
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
@@ -18,7 +24,64 @@ const NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION: &str = "NSApplicationDidRes
 // NSStatusBar thickness (for menu bar)
 const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
 
-/// Registers both global and local NSEvent monitors for Cmd+Shift+E.
+// Carbon Event types
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct EventHotKeyID {
+    signature: u32,
+    id: u32,
+}
+
+#[repr(C)]
+struct EventTypeSpec {
+    event_class: u32,
+    event_kind: u32,
+}
+
+type EventHandlerRef = *mut c_void;
+type EventHotKeyRef = *mut c_void;
+type EventTargetRef = *mut c_void;
+type EventRef = *mut c_void;
+type OSStatus = i32;
+
+type EventHandlerProcPtr = extern "C" fn(
+    handler: EventHandlerRef,
+    event: EventRef,
+    user_data: *mut c_void,
+) -> OSStatus;
+
+// Carbon Event Manager FFI
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn GetEventDispatcherTarget() -> EventTargetRef;
+    fn RegisterEventHotKey(
+        in_hot_key_code: u32,
+        in_hot_key_modifiers: u32,
+        in_hot_key_id: EventHotKeyID,
+        in_target: EventTargetRef,
+        in_options: u32,
+        out_ref: *mut EventHotKeyRef,
+    ) -> OSStatus;
+    fn InstallEventHandler(
+        in_target: EventTargetRef,
+        in_handler: EventHandlerProcPtr,
+        in_num_types: u32,
+        in_list: *const EventTypeSpec,
+        in_user_data: *mut c_void,
+        out_ref: *mut EventHandlerRef,
+    ) -> OSStatus;
+    fn GetEventParameter(
+        in_event: EventRef,
+        in_name: u32,
+        in_desired_type: u32,
+        out_actual_type: *mut u32,
+        in_buffer_size: u32,
+        out_actual_size: *mut u32,
+        out_data: *mut c_void,
+    ) -> OSStatus;
+}
+
+/// Registers a global hotkey using Carbon Events (Cmd+Shift+E).
 /// Also disables window animation and creates a status bar item.
 ///
 /// # Safety
@@ -34,58 +97,107 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
     // SAFETY: ns_window is valid, and create_status_item's requirements are met
     unsafe { create_status_item(ns_window, visible.clone()) };
 
-    // Global monitor — fires when another app is focused
-    {
-        let ns_window = ns_window as usize; // make it Send
-        let visible = visible.clone();
-        let handler = block::ConcreteBlock::new(move |event: id| {
-            unsafe {
-                if is_cmd_shift_e(event) {
-                    toggle_window(ns_window as *mut Object, &visible);
-                }
-            }
-        });
-        let handler = handler.copy();
-        // SAFETY: NSEvent class exists and the handler block is valid
-        let _: id = unsafe {
-            msg_send![
-                class!(NSEvent),
-                addGlobalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-                handler: &*handler
-            ]
-        };
-        std::mem::forget(handler);
-    }
-
-    // Local monitor — fires when our own panel is focused
-    {
-        let ns_window = ns_window as usize;
-        let visible = visible.clone();
-        let handler = block::ConcreteBlock::new(move |event: id| -> id {
-            unsafe {
-                if is_cmd_shift_e(event) {
-                    toggle_window(ns_window as *mut Object, &visible);
-                    nil // swallow the event
-                } else {
-                    event
-                }
-            }
-        });
-        let handler = handler.copy();
-        // SAFETY: NSEvent class exists and the handler block is valid
-        let _: id = unsafe {
-            msg_send![
-                class!(NSEvent),
-                addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-                handler: &*handler
-            ]
-        };
-        std::mem::forget(handler);
-    }
+    // Register Carbon global hotkey (Cmd+Shift+E)
+    // SAFETY: ns_window is valid, visible Arc is cloned
+    unsafe { register_carbon_hotkey(ns_window, visible.clone()) };
 
     // Register for app deactivation to auto-hide window
     // SAFETY: ns_window is valid, visible Arc is cloned
     unsafe { register_deactivation_observer(ns_window, visible) };
+}
+
+/// Registers a global hotkey using Carbon Event Manager.
+/// This is more reliable than NSEvent monitors for background apps.
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer that outlives the hotkey.
+unsafe fn register_carbon_hotkey(ns_window: *mut Object, visible: Arc<AtomicBool>) {
+    // Store in globals for the callback
+    GLOBAL_WINDOW.store(ns_window as usize, Ordering::SeqCst);
+    GLOBAL_VISIBLE.store(Box::into_raw(Box::new(visible)) as usize, Ordering::SeqCst);
+
+    // Define the hotkey ID
+    let hotkey_id = EventHotKeyID {
+        signature: 0x5A454449, // 'ZEDI' - unique signature for our app
+        id: 1,
+    };
+
+    // Get the event dispatcher target
+    // SAFETY: Carbon API call, returns valid target
+    let event_target = unsafe { GetEventDispatcherTarget() };
+
+    // Register the hotkey: Cmd+Shift+E
+    let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
+    // SAFETY: Carbon API call with valid parameters
+    let status = unsafe {
+        RegisterEventHotKey(
+            K_VK_ANSI_E,
+            CMD_KEY | SHIFT_KEY,
+            hotkey_id,
+            event_target,
+            0,
+            &mut hotkey_ref,
+        )
+    };
+
+    if status != 0 {
+        eprintln!("RegisterEventHotKey failed with status: {}", status);
+        return;
+    }
+
+    // Install the event handler
+    let event_type = EventTypeSpec {
+        event_class: K_EVENT_CLASS_KEYBOARD,
+        event_kind: K_EVENT_HOT_KEY_PRESSED,
+    };
+
+    let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
+    // SAFETY: Carbon API call with valid parameters
+    let status = unsafe {
+        InstallEventHandler(
+            event_target,
+            hotkey_handler,
+            1,
+            &event_type,
+            std::ptr::null_mut(),
+            &mut handler_ref,
+        )
+    };
+
+    if status != 0 {
+        eprintln!("InstallEventHandler failed with status: {}", status);
+    }
+}
+
+/// Carbon event handler callback for hotkey presses.
+extern "C" fn hotkey_handler(
+    _handler: EventHandlerRef,
+    event: EventRef,
+    _user_data: *mut c_void,
+) -> OSStatus {
+    unsafe {
+        // Get the hotkey ID from the event
+        let mut hotkey_id = EventHotKeyID { signature: 0, id: 0 };
+        let status = GetEventParameter(
+            event,
+            K_EVENT_PARAM_DIRECT_OBJECT,
+            TYPE_EVENT_HOT_KEY_ID,
+            std::ptr::null_mut(),
+            std::mem::size_of::<EventHotKeyID>() as u32,
+            std::ptr::null_mut(),
+            &mut hotkey_id as *mut EventHotKeyID as *mut c_void,
+        );
+
+        if status == 0 && hotkey_id.id == 1 {
+            // Our hotkey was pressed - toggle the window
+            let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+            let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+            if !visible_ptr.is_null() && !ns_window.is_null() {
+                toggle_window(ns_window, &*visible_ptr);
+            }
+        }
+    }
+    0 // noErr
 }
 
 /// Registers an observer for NSApplicationDidResignActiveNotification.
@@ -166,7 +278,7 @@ unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
     unsafe { setup_status_button_action(button) };
 }
 
-// Global state for the status item callback
+// Global state for the status item callback and hotkey handler
 static GLOBAL_STATUS_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static GLOBAL_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static GLOBAL_VISIBLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -220,14 +332,6 @@ unsafe fn setup_status_button_action(button: id) {
     // The ObjC runtime retains it via setTarget:.
 }
 
-unsafe fn is_cmd_shift_e(event: id) -> bool {
-    let key_code: u16 = msg_send![event, keyCode];
-    let modifier_flags: u64 = msg_send![event, modifierFlags];
-    let cmd = modifier_flags & NSEventModifierFlags::NSCommandKeyMask.bits() != 0;
-    let shift = modifier_flags & NSEventModifierFlags::NSShiftKeyMask.bits() != 0;
-    key_code == KEY_CODE_E && cmd && shift
-}
-
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
         let _: () = msg_send![ns_window, orderOut: nil];
@@ -241,6 +345,10 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
         // Center on the screen with the mouse cursor
         let _: () = msg_send![ns_window, center];
         let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+
+        // Force to front regardless of window level
+        let _: () = msg_send![ns_window, orderFrontRegardless];
+
         visible.store(true, Ordering::SeqCst);
     }
 }
