@@ -282,6 +282,8 @@ unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
 static GLOBAL_STATUS_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static GLOBAL_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static GLOBAL_VISIBLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// Store the previously focused app to restore focus when hiding
+static GLOBAL_PREVIOUS_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe fn setup_status_button_action(button: id) {
     use objc::declare::ClassDecl;
@@ -334,9 +336,33 @@ unsafe fn setup_status_button_action(button: id) {
 
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
+        // Hide the window
         let _: () = msg_send![ns_window, orderOut: nil];
         visible.store(false, Ordering::SeqCst);
+
+        // Restore focus to the previous app
+        let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
+        if !prev_app.is_null() {
+            // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+            let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
+            // Release the retained app reference
+            let _: () = msg_send![prev_app, release];
+        }
     } else {
+        // Capture the currently focused app before we steal focus
+        // SAFETY: NSWorkspace class exists on macOS
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let frontmost_app: id = msg_send![workspace, frontmostApplication];
+        if !frontmost_app.is_null() {
+            // Retain it so it doesn't get deallocated
+            let _: id = msg_send![frontmost_app, retain];
+            // Store the old value and release it if there was one
+            let old = GLOBAL_PREVIOUS_APP.swap(frontmost_app as usize, Ordering::SeqCst) as id;
+            if !old.is_null() {
+                let _: () = msg_send![old, release];
+            }
+        }
+
         // Activate the application so it can receive keyboard focus
         // SAFETY: NSApplication class exists on macOS
         let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
