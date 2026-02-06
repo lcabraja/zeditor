@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 // Carbon Event constants
 const K_VK_ANSI_E: u32 = 0x0E; // Virtual key code for 'E'
+const K_VK_ESCAPE: u16 = 0x35; // Virtual key code for Escape
 const CMD_KEY: u32 = 1 << 8; // cmdKey modifier
 const SHIFT_KEY: u32 = 1 << 9; // shiftKey modifier
 const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962; // 'keyb'
 const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
 const K_EVENT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D2D2D; // '----'
 const TYPE_EVENT_HOT_KEY_ID: u32 = 0x686B6964; // 'hkid'
+const NS_KEY_DOWN_MASK: u64 = 1 << 10; // NSEventMaskKeyDown
 
 // NSWindowAnimationBehavior values
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
@@ -101,6 +103,10 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
     // SAFETY: ns_window is valid, visible Arc is cloned
     unsafe { register_carbon_hotkey(ns_window, visible.clone()) };
 
+    // Register local ESC key monitor to hide window
+    // SAFETY: ns_window is valid, visible Arc is cloned
+    unsafe { register_escape_monitor(ns_window, visible.clone()) };
+
     // Register for app deactivation to auto-hide window
     // SAFETY: ns_window is valid, visible Arc is cloned
     unsafe { register_deactivation_observer(ns_window, visible) };
@@ -167,6 +173,41 @@ unsafe fn register_carbon_hotkey(ns_window: *mut Object, visible: Arc<AtomicBool
     if status != 0 {
         eprintln!("InstallEventHandler failed with status: {}", status);
     }
+}
+
+/// Registers a local event monitor for the ESC key to hide the window.
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer that outlives the monitor.
+unsafe fn register_escape_monitor(ns_window: *mut Object, visible: Arc<AtomicBool>) {
+    let ns_window = ns_window as usize; // make it Send
+
+    let handler = block::ConcreteBlock::new(move |event: id| -> id {
+        unsafe {
+            let key_code: u16 = msg_send![event, keyCode];
+            if key_code == K_VK_ESCAPE && visible.load(Ordering::SeqCst) {
+                // ESC pressed while window is visible - hide it
+                let ns_window = ns_window as *mut Object;
+                let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+                if !visible_ptr.is_null() {
+                    hide_window(ns_window, &*visible_ptr);
+                }
+                return nil; // swallow the event
+            }
+            event
+        }
+    });
+    let handler = handler.copy();
+
+    // SAFETY: NSEvent class exists and the handler block is valid
+    let _: id = unsafe {
+        msg_send![
+            class!(NSEvent),
+            addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
+            handler: &*handler
+        ]
+    };
+    std::mem::forget(handler);
 }
 
 /// Carbon event handler callback for hotkey presses.
@@ -334,20 +375,32 @@ unsafe fn setup_status_button_action(button: id) {
     // The ObjC runtime retains it via setTarget:.
 }
 
+/// Hides the window and restores focus to the previous app.
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer.
+pub unsafe fn hide_window(ns_window: *mut Object, visible: &AtomicBool) {
+    if !visible.load(Ordering::SeqCst) {
+        return; // Already hidden
+    }
+
+    // Hide the window
+    let _: () = msg_send![ns_window, orderOut: nil];
+    visible.store(false, Ordering::SeqCst);
+
+    // Restore focus to the previous app
+    let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
+    if !prev_app.is_null() {
+        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+        let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
+        // Release the retained app reference
+        let _: () = msg_send![prev_app, release];
+    }
+}
+
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
-        // Hide the window
-        let _: () = msg_send![ns_window, orderOut: nil];
-        visible.store(false, Ordering::SeqCst);
-
-        // Restore focus to the previous app
-        let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
-        if !prev_app.is_null() {
-            // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
-            let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
-            // Release the retained app reference
-            let _: () = msg_send![prev_app, release];
-        }
+        hide_window(ns_window, visible);
     } else {
         // Capture the currently focused app before we steal focus
         // SAFETY: NSWorkspace class exists on macOS
