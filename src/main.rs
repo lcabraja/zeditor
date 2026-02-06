@@ -14,7 +14,7 @@ use raw_window_handle::HasWindowHandle;
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
 
-actions!(popup_editor, [Quit, Escape]);
+actions!(popup_editor, [Quit, Escape, SubmitAndPaste]);
 
 pub struct PopupEditor {
     editor: Entity<MultiLineEditor>,
@@ -38,6 +38,19 @@ impl PopupEditor {
             hide_window(window);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn submit_and_paste(&mut self, _: &SubmitAndPaste, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).get_submit_text();
+        unsafe {
+            hotkey::submit_and_paste(&text);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn submit_and_paste(&mut self, _: &SubmitAndPaste, _window: &mut Window, _cx: &mut Context<Self>) {
+        // No-op on other platforms
+    }
 }
 
 impl Render for PopupEditor {
@@ -48,6 +61,7 @@ impl Render for PopupEditor {
             .key_context("PopupEditor")
             .track_focus(&self.editor.read(cx).focus_handle)
             .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::submit_and_paste))
             .flex()
             .flex_col()
             .size_full()
@@ -103,6 +117,7 @@ fn main() {
         cx.bind_keys([
             // App-level keybindings
             KeyBinding::new("escape", Escape, Some("PopupEditor")),
+            KeyBinding::new("cmd-enter", SubmitAndPaste, Some("PopupEditor")),
             KeyBinding::new("cmd-q", Quit, None),
             // Editor keybindings
             KeyBinding::new("backspace", Backspace, Some("MultiLineEditor")),

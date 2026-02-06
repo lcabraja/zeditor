@@ -400,7 +400,8 @@ pub unsafe fn hide_window(ns_window: *mut Object, visible: &AtomicBool) {
 
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
-        hide_window(ns_window, visible);
+        // SAFETY: ns_window and visible are valid per function contract
+        unsafe { hide_window(ns_window, visible) };
     } else {
         // Capture the currently focused app before we steal focus
         // SAFETY: NSWorkspace class exists on macOS
@@ -430,4 +431,95 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
 
         visible.store(true, Ordering::SeqCst);
     }
+}
+
+/// Submits text by copying to clipboard, hiding the window, restoring focus,
+/// and simulating Cmd+V to paste into the previous app.
+///
+/// # Safety
+/// Must be called from the main thread with a valid ns_window pointer.
+pub unsafe fn submit_and_paste(text: &str) {
+    // Copy text to the system clipboard using NSPasteboard
+    // SAFETY: NSPasteboard class exists on macOS
+    let pasteboard: id = unsafe { msg_send![class!(NSPasteboard), generalPasteboard] };
+    let _: () = unsafe { msg_send![pasteboard, clearContents] };
+
+    // SAFETY: NSString::alloc and init_str are safe
+    let ns_string: id = unsafe { NSString::alloc(nil).init_str(text) };
+    // SAFETY: NSPasteboardType class exists on macOS
+    let string_type: id = unsafe { msg_send![class!(NSPasteboardType), string] };
+    let _: bool = unsafe { msg_send![pasteboard, setString: ns_string forType: string_type] };
+
+    // Hide the window and restore focus to previous app
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+    if !ns_window.is_null() && !visible_ptr.is_null() {
+        // SAFETY: pointers checked above
+        unsafe { hide_window(ns_window, &*visible_ptr) };
+    }
+
+    // Wait a bit for focus to restore, then simulate Cmd+V
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // SAFETY: CGEvent functions are safe to call from any thread
+        unsafe { simulate_paste() };
+    });
+}
+
+/// Simulates Cmd+V keypress using CGEvent.
+unsafe fn simulate_paste() {
+    // CGEvent bindings
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
+        fn CGEventCreateKeyboardEvent(
+            source: *mut c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> *mut c_void;
+        fn CGEventSetFlags(event: *mut c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *mut c_void);
+        fn CFRelease(cf: *mut c_void);
+    }
+
+    const K_VK_ANSI_V: u16 = 0x09; // Virtual key code for 'V'
+    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
+
+    // SAFETY: CGEventSourceCreate is safe to call
+    let source = unsafe { CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE) };
+    if source.is_null() {
+        return;
+    }
+
+    // Key down
+    // SAFETY: source is valid, K_VK_ANSI_V is a valid key code
+    let key_down = unsafe { CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true) };
+    if !key_down.is_null() {
+        // SAFETY: key_down is valid
+        unsafe {
+            CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventPost(K_CG_HID_EVENT_TAP, key_down);
+            CFRelease(key_down);
+        }
+    }
+
+    // Small delay between key down and key up
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Key up
+    // SAFETY: source is valid, K_VK_ANSI_V is a valid key code
+    let key_up = unsafe { CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false) };
+    if !key_up.is_null() {
+        // SAFETY: key_up is valid
+        unsafe {
+            CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventPost(K_CG_HID_EVENT_TAP, key_up);
+            CFRelease(key_up);
+        }
+    }
+
+    // SAFETY: source is valid
+    unsafe { CFRelease(source) };
 }

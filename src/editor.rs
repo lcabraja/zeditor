@@ -52,6 +52,7 @@ actions!(
         MoveLineDown,
         AddCursorUp,
         AddCursorDown,
+        SubmitAndPaste,
     ]
 );
 
@@ -720,6 +721,51 @@ impl MultiLineEditor {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.insert_text_at_cursors("", window, cx);
         }
+    }
+
+    /// Get the text to submit/paste.
+    /// - If any cursor has a selection, join all selected texts
+    ///   (same line = space separator, different lines = newline separator)
+    /// - If no selections, return all editor text
+    pub fn get_submit_text(&self) -> String {
+        // Check if any cursor has a selection
+        let has_any_selection = self.cursors.iter().any(|c| c.has_selection());
+
+        if !has_any_selection {
+            // No selections - return entire editor content
+            return self.lines.join("\n");
+        }
+
+        // Collect all selections sorted by position
+        let mut selections: Vec<(CursorPosition, CursorPosition)> = self
+            .cursors
+            .iter()
+            .filter_map(|c| c.selection_range())
+            .collect();
+        selections.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Join selections: same line = space, different lines = newline
+        let mut result = String::new();
+        let mut last_line: Option<usize> = None;
+
+        for (start, end) in selections {
+            let text = self.text_in_range(&start, &end);
+
+            if let Some(prev_line) = last_line {
+                if start.line == prev_line {
+                    // Same line as previous selection - join with space
+                    result.push(' ');
+                } else {
+                    // Different line - join with newline
+                    result.push('\n');
+                }
+            }
+
+            result.push_str(&text);
+            last_line = Some(end.line);
+        }
+
+        result
     }
 
     // --- Vertical movement ---
