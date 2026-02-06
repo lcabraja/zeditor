@@ -440,16 +440,24 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
 /// # Safety
 /// Must be called from the main thread with a valid ns_window pointer.
 pub unsafe fn submit_and_paste(text: &str) {
+    // Wrap in catch_unwind to prevent panics from propagating across FFI
+    let text = text.to_string();
+    let _ = std::panic::catch_unwind(move || {
+        unsafe { submit_and_paste_inner(&text) }
+    });
+}
+
+unsafe fn submit_and_paste_inner(text: &str) {
     // Copy text to the system clipboard using NSPasteboard
     // SAFETY: NSPasteboard class exists on macOS
-    let pasteboard: id = unsafe { msg_send![class!(NSPasteboard), generalPasteboard] };
-    let _: () = unsafe { msg_send![pasteboard, clearContents] };
+    let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
+    let _: () = msg_send![pasteboard, clearContents];
 
     // SAFETY: NSString::alloc and init_str are safe
-    let ns_string: id = unsafe { NSString::alloc(nil).init_str(text) };
+    let ns_string: id = NSString::alloc(nil).init_str(text);
     // SAFETY: NSPasteboardType class exists on macOS
-    let string_type: id = unsafe { msg_send![class!(NSPasteboardType), string] };
-    let _: bool = unsafe { msg_send![pasteboard, setString: ns_string forType: string_type] };
+    let string_type: id = msg_send![class!(NSPasteboardType), string];
+    let _: bool = msg_send![pasteboard, setString: ns_string forType: string_type];
 
     // Hide the window (but don't restore focus yet - we do that explicitly)
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
@@ -460,21 +468,21 @@ pub unsafe fn submit_and_paste(text: &str) {
 
     if !ns_window.is_null() && !visible_ptr.is_null() {
         // Just hide the window, don't call hide_window which would also try to restore focus
-        let _: () = unsafe { msg_send![ns_window, orderOut: nil] };
-        unsafe { (*visible_ptr).store(false, Ordering::SeqCst) };
+        let _: () = msg_send![ns_window, orderOut: nil];
+        (*visible_ptr).store(false, Ordering::SeqCst);
     }
 
     // Activate the previous app and store it for later release
     if !prev_app.is_null() {
         // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
-        let _: bool = unsafe { msg_send![prev_app, activateWithOptions: 2u64] };
+        let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
         // Store for release after paste
         PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
     }
 
     // Schedule paste after a delay using NSObject performSelector:withObject:afterDelay:
     // We need to create a helper object to receive the selector
-    unsafe { schedule_paste_with_delay() };
+    schedule_paste_with_delay();
 }
 
 // Store app to release after paste
@@ -490,19 +498,28 @@ unsafe fn schedule_paste_with_delay() {
     let helper_class = if let Some(cls) = Class::get(class_name) {
         cls
     } else {
-        let superclass = Class::get("NSObject").unwrap();
-        let mut decl = ClassDecl::new(class_name, superclass).unwrap();
+        let Some(superclass) = Class::get("NSObject") else {
+            eprintln!("Failed to get NSObject class");
+            return;
+        };
+        let Some(mut decl) = ClassDecl::new(class_name, superclass) else {
+            eprintln!("Failed to create class declaration");
+            return;
+        };
 
         extern "C" fn do_paste(_self: &Object, _cmd: Sel) {
-            unsafe {
-                simulate_paste();
+            // Catch panics to avoid unwinding across FFI
+            let _ = std::panic::catch_unwind(|| {
+                unsafe {
+                    simulate_paste();
 
-                // Release the previous app reference
-                let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
-                if !prev_app.is_null() {
-                    let _: () = msg_send![prev_app, release];
+                    // Release the previous app reference
+                    let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
+                    if !prev_app.is_null() {
+                        let _: () = msg_send![prev_app, release];
+                    }
                 }
-            }
+            });
         }
 
         unsafe {
@@ -516,13 +533,15 @@ unsafe fn schedule_paste_with_delay() {
     };
 
     // Create instance and schedule
-    let helper: id = msg_send![helper_class, new];
-    let _: () = msg_send![
-        helper,
-        performSelector: sel!(doPaste)
-        withObject: nil
-        afterDelay: 0.15f64
-    ];
+    let helper: id = unsafe { msg_send![helper_class, new] };
+    let _: () = unsafe {
+        msg_send![
+            helper,
+            performSelector: sel!(doPaste)
+            withObject: nil
+            afterDelay: 0.15f64
+        ]
+    };
     // Note: performSelector retains the object until after the delay
 }
 
