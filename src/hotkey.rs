@@ -433,6 +433,7 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     }
 }
 
+
 /// Submits text by copying to clipboard, hiding the window, restoring focus,
 /// and simulating Cmd+V to paste into the previous app.
 ///
@@ -450,20 +451,79 @@ pub unsafe fn submit_and_paste(text: &str) {
     let string_type: id = unsafe { msg_send![class!(NSPasteboardType), string] };
     let _: bool = unsafe { msg_send![pasteboard, setString: ns_string forType: string_type] };
 
-    // Hide the window and restore focus to previous app
+    // Hide the window (but don't restore focus yet - we do that explicitly)
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+
+    // Get the previous app before hiding
+    let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
+
     if !ns_window.is_null() && !visible_ptr.is_null() {
-        // SAFETY: pointers checked above
-        unsafe { hide_window(ns_window, &*visible_ptr) };
+        // Just hide the window, don't call hide_window which would also try to restore focus
+        let _: () = unsafe { msg_send![ns_window, orderOut: nil] };
+        unsafe { (*visible_ptr).store(false, Ordering::SeqCst) };
     }
 
-    // Wait a bit for focus to restore, then simulate Cmd+V
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        // SAFETY: CGEvent functions are safe to call from any thread
-        unsafe { simulate_paste() };
-    });
+    // Activate the previous app and store it for later release
+    if !prev_app.is_null() {
+        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+        let _: bool = unsafe { msg_send![prev_app, activateWithOptions: 2u64] };
+        // Store for release after paste
+        PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
+    }
+
+    // Schedule paste after a delay using NSObject performSelector:withObject:afterDelay:
+    // We need to create a helper object to receive the selector
+    unsafe { schedule_paste_with_delay() };
+}
+
+// Store app to release after paste
+static PENDING_RELEASE_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Schedules the paste operation using NSTimer
+unsafe fn schedule_paste_with_delay() {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Sel};
+
+    // Create or get our helper class
+    let class_name = "ZeditorPasteHelper";
+    let helper_class = if let Some(cls) = Class::get(class_name) {
+        cls
+    } else {
+        let superclass = Class::get("NSObject").unwrap();
+        let mut decl = ClassDecl::new(class_name, superclass).unwrap();
+
+        extern "C" fn do_paste(_self: &Object, _cmd: Sel) {
+            unsafe {
+                simulate_paste();
+
+                // Release the previous app reference
+                let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
+                if !prev_app.is_null() {
+                    let _: () = msg_send![prev_app, release];
+                }
+            }
+        }
+
+        unsafe {
+            decl.add_method(
+                sel!(doPaste),
+                do_paste as extern "C" fn(&Object, Sel),
+            );
+        }
+
+        decl.register()
+    };
+
+    // Create instance and schedule
+    let helper: id = msg_send![helper_class, new];
+    let _: () = msg_send![
+        helper,
+        performSelector: sel!(doPaste)
+        withObject: nil
+        afterDelay: 0.15f64
+    ];
+    // Note: performSelector retains the object until after the delay
 }
 
 /// Simulates Cmd+V keypress using CGEvent.
