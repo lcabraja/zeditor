@@ -1,0 +1,24 @@
+[package]
+name = "popup-editor"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+path = "src/main.rs"
+name = "popup-editor"
+
+[dependencies]
+anyhow = "1"
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+rust-embed = "8"
+unicode-segmentation = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = "=21.0.0"
+cocoa = "0.26"
+objc = "0.2"
+block = "0.1"
+raw-window-handle = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSColor", "NSColorSpace", "NSApplication", "NSWindow", "NSResponder"] }
+objc2-foundation = "0.3"
