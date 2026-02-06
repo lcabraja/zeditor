@@ -22,7 +22,7 @@ pub struct PopupEditor {
 
 impl PopupEditor {
     fn new(cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(|cx| MultiLineEditor::new(cx));
+        let editor = cx.new(MultiLineEditor::new);
         Self { editor }
     }
 

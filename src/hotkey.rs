@@ -23,10 +23,12 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
     let visible = Arc::new(AtomicBool::new(false));
 
     // Disable window animation for instant show/hide
-    let _: () = msg_send![ns_window, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE];
+    // SAFETY: ns_window is a valid NSWindow pointer per the function's safety contract
+    let _: () = unsafe { msg_send![ns_window, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE] };
 
     // Create status bar item (menu bar icon)
-    create_status_item(ns_window, visible.clone());
+    // SAFETY: ns_window is valid, and create_status_item's requirements are met
+    unsafe { create_status_item(ns_window, visible.clone()) };
 
     // Global monitor — fires when another app is focused
     {
@@ -40,11 +42,14 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
             }
         });
         let handler = handler.copy();
-        let _: id = msg_send![
-            class!(NSEvent),
-            addGlobalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-            handler: &*handler
-        ];
+        // SAFETY: NSEvent class exists and the handler block is valid
+        let _: id = unsafe {
+            msg_send![
+                class!(NSEvent),
+                addGlobalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
+                handler: &*handler
+            ]
+        };
         std::mem::forget(handler);
     }
 
@@ -63,29 +68,38 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
             }
         });
         let handler = handler.copy();
-        let _: id = msg_send![
-            class!(NSEvent),
-            addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-            handler: &*handler
-        ];
+        // SAFETY: NSEvent class exists and the handler block is valid
+        let _: id = unsafe {
+            msg_send![
+                class!(NSEvent),
+                addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
+                handler: &*handler
+            ]
+        };
         std::mem::forget(handler);
     }
 }
 
 unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
     // Get the system status bar
-    let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
+    // SAFETY: NSStatusBar class exists on macOS
+    let status_bar: id = unsafe { msg_send![class!(NSStatusBar), systemStatusBar] };
 
     // Create a status item with variable length
-    let status_item: id = msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH];
+    // SAFETY: status_bar is a valid NSStatusBar instance
+    let status_item: id =
+        unsafe { msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH] };
 
     // Get the button from the status item
-    let button: id = msg_send![status_item, button];
+    // SAFETY: status_item is a valid NSStatusItem instance
+    let button: id = unsafe { msg_send![status_item, button] };
 
     // Set the title to a simple "Z" character (or could use an SF Symbol)
     use cocoa::foundation::NSString;
-    let title = NSString::alloc(nil).init_str("Z");
-    let _: () = msg_send![button, setTitle: title];
+    // SAFETY: NSString::alloc and init_str are safe with valid nil argument
+    let title = unsafe { NSString::alloc(nil).init_str("Z") };
+    // SAFETY: button is a valid NSStatusBarButton instance
+    let _: () = unsafe { msg_send![button, setTitle: title] };
 
     // Store the status item to prevent it from being released
     // We'll use statics to keep references alive
@@ -96,7 +110,8 @@ unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
 
     // Set up click handling via NSButton's action
     // We need to create an Objective-C object to receive the action
-    setup_status_button_action(button);
+    // SAFETY: button is a valid NSStatusBarButton instance
+    unsafe { setup_status_button_action(button) };
 }
 
 // Global state for the status item callback
@@ -129,30 +144,35 @@ unsafe fn setup_status_button_action(button: id) {
             }
         }
 
-        decl.add_method(
-            sel!(statusItemClicked:),
-            handle_click as extern "C" fn(&Object, Sel, id),
-        );
+        // SAFETY: Adding a method to a class being declared, with valid selector and fn pointer
+        unsafe {
+            decl.add_method(
+                sel!(statusItemClicked:),
+                handle_click as extern "C" fn(&Object, Sel, id),
+            );
+        }
 
         decl.register()
     };
 
     // Create an instance of our target class
-    let target: id = msg_send![target_class, new];
+    // SAFETY: target_class is a valid registered ObjC class
+    let target: id = unsafe { msg_send![target_class, new] };
 
     // Set the button's target and action
-    let _: () = msg_send![button, setTarget: target];
-    let _: () = msg_send![button, setAction: sel!(statusItemClicked:)];
+    // SAFETY: button is a valid NSStatusBarButton, target is a valid ObjC object
+    let _: () = unsafe { msg_send![button, setTarget: target] };
+    let _: () = unsafe { msg_send![button, setAction: sel!(statusItemClicked:)] };
 
-    // Keep target alive
-    std::mem::forget(target);
+    // Note: target is a raw pointer (Copy type), so we don't need mem::forget.
+    // The ObjC runtime retains it via setTarget:.
 }
 
 unsafe fn is_cmd_shift_e(event: id) -> bool {
     let key_code: u16 = msg_send![event, keyCode];
     let modifier_flags: u64 = msg_send![event, modifierFlags];
-    let cmd = modifier_flags & NSEventModifierFlags::NSCommandKeyMask.bits() as u64 != 0;
-    let shift = modifier_flags & NSEventModifierFlags::NSShiftKeyMask.bits() as u64 != 0;
+    let cmd = modifier_flags & NSEventModifierFlags::NSCommandKeyMask.bits() != 0;
+    let shift = modifier_flags & NSEventModifierFlags::NSShiftKeyMask.bits() != 0;
     key_code == KEY_CODE_E && cmd && shift
 }
 

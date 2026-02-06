@@ -167,7 +167,7 @@ impl MultiLineEditor {
         if pos.line < self.lines.len() {
             offset += pos.col.min(self.lines[pos.line].len());
         }
-        offset.saturating_sub(if pos.line > 0 { 0 } else { 0 })
+        offset
     }
 
     fn position_from_flat(&self, offset: usize) -> CursorPosition {
@@ -619,10 +619,11 @@ impl MultiLineEditor {
             if c.position.line >= start_line && c.position.line <= end_line {
                 c.position.line -= 1;
             }
-            if let Some(ref mut a) = c.anchor {
-                if a.line >= start_line && a.line <= end_line {
-                    a.line -= 1;
-                }
+            if let Some(ref mut a) = c.anchor
+                && a.line >= start_line
+                && a.line <= end_line
+            {
+                a.line -= 1;
             }
         }
         self.reset_cursor_blink(cx);
@@ -644,10 +645,11 @@ impl MultiLineEditor {
             if c.position.line >= start_line && c.position.line <= end_line {
                 c.position.line += 1;
             }
-            if let Some(ref mut a) = c.anchor {
-                if a.line >= start_line && a.line <= end_line {
-                    a.line += 1;
-                }
+            if let Some(ref mut a) = c.anchor
+                && a.line >= start_line
+                && a.line <= end_line
+            {
+                a.line += 1;
             }
         }
         self.reset_cursor_blink(cx);
@@ -724,13 +726,10 @@ impl MultiLineEditor {
 
     fn move_vertically(&mut self, direction: i32, selecting: bool, cx: &mut Context<Self>) {
         // Ensure preferred_col_x is set from current position
-        if self.preferred_col_x.is_none() {
-            if let Some(shaped) = self
-                .last_shaped_lines
-                .get(self.cursors[0].position.line)
-            {
-                self.preferred_col_x = Some(shaped.x_for_index(self.cursors[0].position.col));
-            }
+        if self.preferred_col_x.is_none()
+            && let Some(shaped) = self.last_shaped_lines.get(self.cursors[0].position.line)
+        {
+            self.preferred_col_x = Some(shaped.x_for_index(self.cursors[0].position.col));
         }
 
         for c in &mut self.cursors {
@@ -792,10 +791,10 @@ impl MultiLineEditor {
     }
 
     fn col_for_preferred_x(&self, line: usize, _cx: &mut Context<Self>) -> usize {
-        if let Some(px_x) = self.preferred_col_x {
-            if let Some(shaped) = self.last_shaped_lines.get(line) {
-                return shaped.closest_index_for_x(px_x);
-            }
+        if let Some(px_x) = self.preferred_col_x
+            && let Some(shaped) = self.last_shaped_lines.get(line)
+        {
+            return shaped.closest_index_for_x(px_x);
         }
         // Fallback: use primary cursor col clamped to line length
         self.cursors[0].position.col.min(self.lines[line].len())
@@ -876,16 +875,16 @@ impl MultiLineEditor {
     {
         // For cursors without selection, expand using expand_fn
         for c in &mut self.cursors {
-            if !c.has_selection() {
-                if let Some((start, end)) = expand_fn(&c.position, &self.lines) {
-                    c.anchor = Some(start);
-                    c.position = end;
-                    // Normalize so anchor < position
-                    let s = c.selection_start();
-                    let e = c.selection_end();
-                    c.anchor = Some(s);
-                    c.position = e;
-                }
+            if !c.has_selection()
+                && let Some((start, end)) = expand_fn(&c.position, &self.lines)
+            {
+                c.anchor = Some(start);
+                c.position = end;
+                // Normalize so anchor < position
+                let s = c.selection_start();
+                let e = c.selection_end();
+                c.anchor = Some(s);
+                c.position = e;
             }
         }
         self.insert_text_at_cursors(replacement, window, cx);
