@@ -1,5 +1,6 @@
 use cocoa::appkit::NSEventModifierFlags;
 use cocoa::base::{id, nil};
+use cocoa::foundation::NSString;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,9 @@ const NS_KEY_DOWN_MASK: u64 = 1 << 10;
 
 // NSWindowAnimationBehavior values
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
+
+// Notification name for app deactivation
+const NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION: &str = "NSApplicationDidResignActiveNotification";
 
 // NSStatusBar thickness (for menu bar)
 const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
@@ -78,6 +82,55 @@ pub unsafe fn register_hotkey(ns_window: *mut Object) {
         };
         std::mem::forget(handler);
     }
+
+    // Register for app deactivation to auto-hide window
+    // SAFETY: ns_window is valid, visible Arc is cloned
+    unsafe { register_deactivation_observer(ns_window, visible) };
+}
+
+/// Registers an observer for NSApplicationDidResignActiveNotification.
+/// When the app loses focus, the window is automatically hidden.
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer that outlives the observer.
+unsafe fn register_deactivation_observer(ns_window: *mut Object, visible: Arc<AtomicBool>) {
+    let ns_window = ns_window as usize; // make it Send
+
+    let handler = block::ConcreteBlock::new(move |_notification: id| {
+        // When app loses focus, hide the window
+        if visible.load(Ordering::SeqCst) {
+            unsafe {
+                let ns_window = ns_window as *mut Object;
+                let _: () = msg_send![ns_window, orderOut: nil];
+            }
+            visible.store(false, Ordering::SeqCst);
+        }
+    });
+    let handler = handler.copy();
+
+    // Get the default notification center
+    // SAFETY: NSNotificationCenter class exists on macOS
+    let notification_center: id =
+        unsafe { msg_send![class!(NSNotificationCenter), defaultCenter] };
+
+    // Create the notification name string
+    // SAFETY: NSString::alloc and init_str are safe
+    let notification_name =
+        unsafe { NSString::alloc(nil).init_str(NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION) };
+
+    // Register the observer
+    // SAFETY: notification_center is valid, handler block is valid
+    let _: id = unsafe {
+        msg_send![
+            notification_center,
+            addObserverForName: notification_name
+            object: nil
+            queue: nil
+            usingBlock: &*handler
+        ]
+    };
+
+    std::mem::forget(handler);
 }
 
 unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
@@ -95,7 +148,6 @@ unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
     let button: id = unsafe { msg_send![status_item, button] };
 
     // Set the title to a simple "Z" character (or could use an SF Symbol)
-    use cocoa::foundation::NSString;
     // SAFETY: NSString::alloc and init_str are safe with valid nil argument
     let title = unsafe { NSString::alloc(nil).init_str("Z") };
     // SAFETY: button is a valid NSStatusBarButton instance
@@ -181,6 +233,11 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
         let _: () = msg_send![ns_window, orderOut: nil];
         visible.store(false, Ordering::SeqCst);
     } else {
+        // Activate the application so it can receive keyboard focus
+        // SAFETY: NSApplication class exists on macOS
+        let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+
         // Center on the screen with the mouse cursor
         let _: () = msg_send![ns_window, center];
         let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
