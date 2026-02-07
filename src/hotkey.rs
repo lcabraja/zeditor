@@ -1,3 +1,6 @@
+// Allow unsafe operations in unsafe fns - this is an FFI-heavy module
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use cocoa::base::{id, nil};
 use cocoa::foundation::NSString;
 use objc::runtime::Object;
