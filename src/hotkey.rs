@@ -555,13 +555,14 @@ unsafe fn schedule_paste_with_delay() {
             helper,
             performSelector: sel!(doPaste)
             withObject: nil
-            afterDelay: 0.05f64
+            afterDelay: 0.1f64
         ]
     };
     // Note: performSelector retains the object until after the delay
 }
 
 /// Simulates paste using the frontmost app's Edit menu.
+/// Runs osascript as a subprocess to avoid blocking the main thread.
 fn simulate_paste() {
     // Check if we still have accessibility permissions
     let trusted = unsafe { AXIsProcessTrusted() };
@@ -576,7 +577,8 @@ fn simulate_paste() {
         return;
     }
 
-    // Use AppleScript to click Edit > Paste in the frontmost app
+    // Use osascript subprocess to avoid blocking the main thread
+    // Click Edit > Paste in the frontmost app
     let script = r#"
 tell application "System Events"
     set frontApp to name of first application process whose frontmost is true
@@ -586,16 +588,16 @@ tell application "System Events"
 end tell
 "#;
 
-    unsafe {
-        let script_str: id = NSString::alloc(nil).init_str(script);
-        let apple_script: id = msg_send![class!(NSAppleScript), alloc];
-        let apple_script: id = msg_send![apple_script, initWithSource: script_str];
-
-        if !apple_script.is_null() {
-            let mut error_dict: id = nil;
-            let _: id = msg_send![apple_script, executeAndReturnError: &mut error_dict];
-            let _: () = msg_send![apple_script, release];
-        }
+    // Spawn osascript and don't wait for it
+    if let Ok(mut child) = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+    {
+        // Wait for completion in a background thread to reap the process
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
