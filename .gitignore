@@ -1,3 +1,7 @@
 target/
 .DS_Store
 .claude/
+AppIcon.iconset/
+progress.md
+test.as
+test_paste.swift
