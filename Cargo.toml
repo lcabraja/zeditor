@@ -3,6 +3,10 @@ name = "popup-editor"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+# Suppress warnings from objc crate's macros
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
+
 [[bin]]
 path = "src/main.rs"
 name = "popup-editor"
