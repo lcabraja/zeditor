@@ -83,12 +83,28 @@ unsafe extern "C" {
     ) -> OSStatus;
 }
 
+// Accessibility API
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: id) -> bool;
+}
+
 /// Registers a global hotkey using Carbon Events (Cmd+Shift+E).
 /// Also disables window animation and creates a status bar item.
 ///
 /// # Safety
 /// `ns_window` must be a valid NSWindow/NSPanel pointer that outlives the monitors.
 pub unsafe fn register_hotkey(ns_window: *mut Object) {
+    // Check if we have accessibility permissions, prompt if not
+    let trusted = unsafe { AXIsProcessTrusted() };
+    if !trusted {
+        let key: id = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
+        let yes_num: id = msg_send![class!(NSNumber), numberWithBool: true];
+        let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes_num forKey: key];
+        let _ = unsafe { AXIsProcessTrustedWithOptions(options) };
+    }
+
     let visible = Arc::new(AtomicBool::new(false));
 
     // Disable window animation for instant show/hide
@@ -403,7 +419,7 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
         // SAFETY: ns_window and visible are valid per function contract
         unsafe { hide_window(ns_window, visible) };
     } else {
-        // Capture the currently focused app before we steal focus
+        // Capture the currently focused app before showing our window
         // SAFETY: NSWorkspace class exists on macOS
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let frontmost_app: id = msg_send![workspace, frontmostApplication];
@@ -418,15 +434,16 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
         }
 
         // Activate the application so it can receive keyboard focus
-        // SAFETY: NSApplication class exists on macOS
         let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
 
-        // Center on the screen with the mouse cursor
+        // Center on the screen
         let _: () = msg_send![ns_window, center];
+
+        // Make window key (for keyboard input) and bring to front
         let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
 
-        // Force to front regardless of window level
+        // Force to front
         let _: () = msg_send![ns_window, orderFrontRegardless];
 
         visible.store(true, Ordering::SeqCst);
@@ -442,51 +459,47 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
 pub unsafe fn submit_and_paste(text: &str) {
     // Wrap in catch_unwind to prevent panics from propagating across FFI
     let text = text.to_string();
-    let _ = std::panic::catch_unwind(move || {
+    let result = std::panic::catch_unwind(move || {
         unsafe { submit_and_paste_inner(&text) }
     });
+    if let Err(e) = result {
+        eprintln!("[submit_and_paste] Panic: {:?}", e);
+    }
 }
 
 unsafe fn submit_and_paste_inner(text: &str) {
-    // Copy text to the system clipboard using NSPasteboard
-    // SAFETY: NSPasteboard class exists on macOS
+    // Copy text to the system clipboard
     let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
     let _: () = msg_send![pasteboard, clearContents];
-
-    // SAFETY: NSString::alloc and init_str are safe
     let ns_string: id = NSString::alloc(nil).init_str(text);
-    // SAFETY: NSPasteboardType class exists on macOS
-    let string_type: id = msg_send![class!(NSPasteboardType), string];
+    let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
     let _: bool = msg_send![pasteboard, setString: ns_string forType: string_type];
 
-    // Hide the window (but don't restore focus yet - we do that explicitly)
+    // Hide the window
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
-
-    // Get the previous app before hiding
     let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
 
     if !ns_window.is_null() && !visible_ptr.is_null() {
-        // Just hide the window, don't call hide_window which would also try to restore focus
         let _: () = msg_send![ns_window, orderOut: nil];
         (*visible_ptr).store(false, Ordering::SeqCst);
     }
 
-    // Activate the previous app and store it for later release
+    // Activate the previous app
     if !prev_app.is_null() {
-        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+        let pid: i32 = msg_send![prev_app, processIdentifier];
+        PENDING_PASTE_PID.store(pid, Ordering::SeqCst);
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
-        // Store for release after paste
         PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
     }
 
-    // Schedule paste after a delay using NSObject performSelector:withObject:afterDelay:
-    // We need to create a helper object to receive the selector
+    // Schedule paste after a short delay
     schedule_paste_with_delay();
 }
 
-// Store app to release after paste
+// Store app to release after paste and its PID for CGEventPostToPid
 static PENDING_RELEASE_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PENDING_PASTE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Schedules the paste operation using NSTimer
 unsafe fn schedule_paste_with_delay() {
@@ -509,7 +522,7 @@ unsafe fn schedule_paste_with_delay() {
 
         extern "C" fn do_paste(_self: &Object, _cmd: Sel) {
             // Catch panics to avoid unwinding across FFI
-            let _ = std::panic::catch_unwind(|| {
+            let result = std::panic::catch_unwind(|| {
                 unsafe {
                     simulate_paste();
 
@@ -520,6 +533,9 @@ unsafe fn schedule_paste_with_delay() {
                     }
                 }
             });
+            if let Err(e) = result {
+                eprintln!("[do_paste] Panic: {:?}", e);
+            }
         }
 
         unsafe {
@@ -539,66 +555,47 @@ unsafe fn schedule_paste_with_delay() {
             helper,
             performSelector: sel!(doPaste)
             withObject: nil
-            afterDelay: 0.15f64
+            afterDelay: 0.05f64
         ]
     };
     // Note: performSelector retains the object until after the delay
 }
 
-/// Simulates Cmd+V keypress using CGEvent.
-unsafe fn simulate_paste() {
-    // CGEvent bindings
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
-        fn CGEventCreateKeyboardEvent(
-            source: *mut c_void,
-            virtual_key: u16,
-            key_down: bool,
-        ) -> *mut c_void;
-        fn CGEventSetFlags(event: *mut c_void, flags: u64);
-        fn CGEventPost(tap: u32, event: *mut c_void);
-        fn CFRelease(cf: *mut c_void);
-    }
-
-    const K_VK_ANSI_V: u16 = 0x09; // Virtual key code for 'V'
-    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
-    const K_CG_HID_EVENT_TAP: u32 = 0;
-    const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
-
-    // SAFETY: CGEventSourceCreate is safe to call
-    let source = unsafe { CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE) };
-    if source.is_null() {
+/// Simulates paste using the frontmost app's Edit menu.
+fn simulate_paste() {
+    // Check if we still have accessibility permissions
+    let trusted = unsafe { AXIsProcessTrusted() };
+    if !trusted {
+        // Prompt user to grant permissions
+        unsafe {
+            let key: id = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
+            let yes_num: id = msg_send![class!(NSNumber), numberWithBool: true];
+            let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes_num forKey: key];
+            let _ = AXIsProcessTrustedWithOptions(options);
+        }
         return;
     }
 
-    // Key down
-    // SAFETY: source is valid, K_VK_ANSI_V is a valid key code
-    let key_down = unsafe { CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true) };
-    if !key_down.is_null() {
-        // SAFETY: key_down is valid
-        unsafe {
-            CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
-            CGEventPost(K_CG_HID_EVENT_TAP, key_down);
-            CFRelease(key_down);
+    // Use AppleScript to click Edit > Paste in the frontmost app
+    let script = r#"
+tell application "System Events"
+    set frontApp to name of first application process whose frontmost is true
+    tell process frontApp
+        click menu item "Paste" of menu "Edit" of menu bar 1
+    end tell
+end tell
+"#;
+
+    unsafe {
+        let script_str: id = NSString::alloc(nil).init_str(script);
+        let apple_script: id = msg_send![class!(NSAppleScript), alloc];
+        let apple_script: id = msg_send![apple_script, initWithSource: script_str];
+
+        if !apple_script.is_null() {
+            let mut error_dict: id = nil;
+            let _: id = msg_send![apple_script, executeAndReturnError: &mut error_dict];
+            let _: () = msg_send![apple_script, release];
         }
     }
-
-    // Small delay between key down and key up
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    // Key up
-    // SAFETY: source is valid, K_VK_ANSI_V is a valid key code
-    let key_up = unsafe { CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false) };
-    if !key_up.is_null() {
-        // SAFETY: key_up is valid
-        unsafe {
-            CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
-            CGEventPost(K_CG_HID_EVENT_TAP, key_up);
-            CFRelease(key_up);
-        }
-    }
-
-    // SAFETY: source is valid
-    unsafe { CFRelease(source) };
 }
+

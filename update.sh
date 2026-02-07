@@ -18,10 +18,15 @@ mkdir -p "$BUNDLE_DIR/Contents/MacOS"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 cp "target/release/${BINARY_NAME}" "$BUNDLE_DIR/Contents/MacOS/${BINARY_NAME}"
 cp Info.plist "$BUNDLE_DIR/Contents/Info.plist"
+cp AppIcon.icns "$BUNDLE_DIR/Contents/Resources/AppIcon.icns"
 
 echo "Installing to ${INSTALL_DIR}..."
 rm -rf "${INSTALL_DIR}/${APP_NAME}.app"
 cp -R "$BUNDLE_DIR" "${INSTALL_DIR}/${APP_NAME}.app"
+
+# Sign with "Zeditor" certificate to preserve Accessibility permissions across rebuilds
+echo "Signing app..."
+codesign --force --sign "Zeditor" "${INSTALL_DIR}/${APP_NAME}.app"
 
 echo "Launching ${APP_NAME}..."
 open "${INSTALL_DIR}/${APP_NAME}.app"
