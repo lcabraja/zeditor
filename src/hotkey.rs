@@ -490,8 +490,6 @@ unsafe fn submit_and_paste_inner(text: &str) {
 
     // Activate the previous app
     if !prev_app.is_null() {
-        let pid: i32 = msg_send![prev_app, processIdentifier];
-        PENDING_PASTE_PID.store(pid, Ordering::SeqCst);
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
         PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
     }
@@ -500,9 +498,8 @@ unsafe fn submit_and_paste_inner(text: &str) {
     schedule_paste_with_delay();
 }
 
-// Store app to release after paste and its PID for CGEventPostToPid
+// Store app to release after paste
 static PENDING_RELEASE_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static PENDING_PASTE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Schedules the paste operation using NSTimer
 unsafe fn schedule_paste_with_delay() {
@@ -558,49 +555,53 @@ unsafe fn schedule_paste_with_delay() {
             helper,
             performSelector: sel!(doPaste)
             withObject: nil
-            afterDelay: 0.1f64
+            afterDelay: 0.05f64
         ]
     };
     // Note: performSelector retains the object until after the delay
 }
 
-/// Simulates paste using the frontmost app's Edit menu.
-/// Runs osascript as a subprocess to avoid blocking the main thread.
-fn simulate_paste() {
-    // Check if we still have accessibility permissions
-    let trusted = unsafe { AXIsProcessTrusted() };
-    if !trusted {
-        // Prompt user to grant permissions
-        unsafe {
-            let key: id = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
-            let yes_num: id = msg_send![class!(NSNumber), numberWithBool: true];
-            let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes_num forKey: key];
-            let _ = AXIsProcessTrustedWithOptions(options);
-        }
+/// Simulates Cmd+V keypress using CGEvent to paste into the frontmost app.
+unsafe fn simulate_paste() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
+        fn CGEventCreateKeyboardEvent(
+            source: *mut c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> *mut c_void;
+        fn CGEventSetFlags(event: *mut c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *mut c_void);
+        fn CFRelease(cf: *mut c_void);
+    }
+
+    const K_VK_ANSI_V: u16 = 0x09;
+    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
+
+    let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE);
+    if source.is_null() {
         return;
     }
 
-    // Use osascript subprocess to avoid blocking the main thread
-    // Click Edit > Paste in the frontmost app
-    let script = r#"
-tell application "System Events"
-    set frontApp to name of first application process whose frontmost is true
-    tell process frontApp
-        click menu item "Paste" of menu "Edit" of menu bar 1
-    end tell
-end tell
-"#;
-
-    // Spawn osascript and don't wait for it
-    if let Ok(mut child) = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn()
-    {
-        // Wait for completion in a background thread to reap the process
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+    // Key down
+    let key_down = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true);
+    if !key_down.is_null() {
+        CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
+        CGEventPost(K_CG_HID_EVENT_TAP, key_down);
+        CFRelease(key_down);
     }
+
+    // Key up
+    let key_up = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false);
+    if !key_up.is_null() {
+        CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
+        CGEventPost(K_CG_HID_EVENT_TAP, key_up);
+        CFRelease(key_up);
+    }
+
+    CFRelease(source);
 }
 

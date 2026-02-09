@@ -177,6 +177,10 @@ fn main() {
             .open_window(options, |window, cx| {
                 cx.new(|cx| {
                     let popup = PopupEditor::new(cx);
+                    // Register focus handler to reset editor with clipboard on show
+                    popup.editor.update(cx, |editor, cx| {
+                        editor.register_focus_handler(window, cx);
+                    });
                     // Focus the editor
                     let focus = popup.editor.read(cx).focus_handle.clone();
                     window.focus(&focus, cx);
