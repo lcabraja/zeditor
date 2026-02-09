@@ -102,6 +102,7 @@ static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static OPEN_PREFS_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static PENDING_CLIPBOARD: Mutex<Option<String>> = Mutex::new(None);
 
 /// Check if the preferences window was requested from the menu.
 /// Atomically swaps the flag and returns the old value.
@@ -119,6 +120,28 @@ fn set_error(err: Option<String>) {
         *g = err;
     }
     unsafe { update_menu_error() };
+}
+
+/// Take the pre-fetched clipboard text (if any). Returns None if no text was pre-fetched.
+/// This is used by the editor to avoid the slow GPUI clipboard read.
+pub fn take_pending_clipboard() -> Option<String> {
+    PENDING_CLIPBOARD.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Read the system clipboard directly via NSPasteboard.
+unsafe fn read_clipboard_native() -> Option<String> {
+    let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
+    let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
+    let ns_string: id = msg_send![pasteboard, stringForType: string_type];
+    if ns_string.is_null() {
+        return None;
+    }
+    let c_str: *const std::ffi::c_char = msg_send![ns_string, UTF8String];
+    if c_str.is_null() {
+        return None;
+    }
+    let text = std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn version_string() -> String {
@@ -575,6 +598,12 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
         hide_window(ns_window, visible);
     } else {
+        // Pre-fetch clipboard BEFORE showing window (avoids GPUI latency)
+        let clipboard_text = read_clipboard_native();
+        if let Ok(mut pending) = PENDING_CLIPBOARD.lock() {
+            *pending = clipboard_text;
+        }
+
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let frontmost_app: id = msg_send![workspace, frontmostApplication];
         if !frontmost_app.is_null() {

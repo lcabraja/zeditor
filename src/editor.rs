@@ -53,6 +53,10 @@ actions!(
         AddCursorUp,
         AddCursorDown,
         SubmitAndPaste,
+        SelectHome,
+        SelectEnd,
+        SelectDocumentStart,
+        SelectDocumentEnd,
     ]
 );
 
@@ -167,6 +171,16 @@ impl MultiLineEditor {
 
     /// Reset editor contents: load text from clipboard if available, otherwise empty.
     fn reset_with_clipboard(&mut self, cx: &mut Context<Self>) {
+        // Try pre-fetched clipboard first (set by hotkey::toggle_window via NSPasteboard)
+        // Falls back to GPUI clipboard if not available
+        #[cfg(target_os = "macos")]
+        let clipboard_text = crate::hotkey::take_pending_clipboard()
+            .or_else(|| {
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .filter(|t| !t.is_empty())
+            });
+        #[cfg(not(target_os = "macos"))]
         let clipboard_text = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -519,6 +533,50 @@ impl MultiLineEditor {
         let last = self.lines.len() - 1;
         self.preferred_col_x = None;
         self.move_cursors_to(CursorPosition::new(last, self.lines[last].len()), cx);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.preferred_col_x = None;
+        self.select_each_cursor(
+            |pos, _lines| CursorPosition::new(pos.line, 0),
+            cx,
+        );
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.preferred_col_x = None;
+        self.select_each_cursor(
+            |pos, lines| CursorPosition::new(pos.line, lines[pos.line].len()),
+            cx,
+        );
+    }
+
+    fn select_document_start(&mut self, _: &SelectDocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.preferred_col_x = None;
+        let pos = CursorPosition::new(0, 0);
+        for c in &mut self.cursors {
+            if c.anchor.is_none() {
+                c.anchor = Some(c.position.clone());
+            }
+            c.position = pos.clone();
+        }
+        self.merge_overlapping_cursors();
+        cx.notify();
+    }
+
+    fn select_document_end(&mut self, _: &SelectDocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let last = self.lines.len() - 1;
+        let last_col = self.lines[last].len();
+        self.preferred_col_x = None;
+        let pos = CursorPosition::new(last, last_col);
+        for c in &mut self.cursors {
+            if c.anchor.is_none() {
+                c.anchor = Some(c.position.clone());
+            }
+            c.position = pos.clone();
+        }
+        self.merge_overlapping_cursors();
+        cx.notify();
     }
 
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1455,6 +1513,10 @@ impl Render for MultiLineEditor {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::document_start))
             .on_action(cx.listener(Self::document_end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::select_document_start))
+            .on_action(cx.listener(Self::select_document_end))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::select_word_left))

@@ -18,7 +18,7 @@ use raw_window_handle::HasWindowHandle;
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
 
-actions!(popup_editor, [Quit, Escape, SubmitAndPaste]);
+actions!(popup_editor, [Quit, Escape, SubmitAndPaste, OpenPreferences]);
 
 pub struct PopupEditor {
     editor: Entity<MultiLineEditor>,
@@ -55,6 +55,14 @@ impl PopupEditor {
     fn submit_and_paste(&mut self, _: &SubmitAndPaste, _window: &mut Window, _cx: &mut Context<Self>) {
         // No-op on other platforms
     }
+
+    #[cfg(target_os = "macos")]
+    fn open_preferences(&mut self, _: &OpenPreferences, _window: &mut Window, cx: &mut Context<Self>) {
+        open_preferences_window(cx);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn open_preferences(&mut self, _: &OpenPreferences, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 impl Render for PopupEditor {
@@ -66,6 +74,7 @@ impl Render for PopupEditor {
             .track_focus(&self.editor.read(cx).focus_handle)
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::submit_and_paste))
+            .on_action(cx.listener(Self::open_preferences))
             .flex()
             .flex_col()
             .size_full()
@@ -122,6 +131,7 @@ fn main() {
             // App-level keybindings
             KeyBinding::new("escape", Escape, Some("PopupEditor")),
             KeyBinding::new("cmd-enter", SubmitAndPaste, Some("PopupEditor")),
+            KeyBinding::new("cmd-,", OpenPreferences, Some("PopupEditor")),
             KeyBinding::new("cmd-q", Quit, None),
             // Editor keybindings
             KeyBinding::new("backspace", Backspace, Some("MultiLineEditor")),
@@ -143,6 +153,10 @@ fn main() {
             KeyBinding::new("cmd-right", End, Some("MultiLineEditor")),
             KeyBinding::new("cmd-up", DocumentStart, Some("MultiLineEditor")),
             KeyBinding::new("cmd-down", DocumentEnd, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-shift-left", SelectHome, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-shift-right", SelectEnd, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-shift-up", SelectDocumentStart, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-shift-down", SelectDocumentEnd, Some("MultiLineEditor")),
             KeyBinding::new("alt-left", WordLeft, Some("MultiLineEditor")),
             KeyBinding::new("alt-right", WordRight, Some("MultiLineEditor")),
             KeyBinding::new("alt-shift-left", SelectWordLeft, Some("MultiLineEditor")),

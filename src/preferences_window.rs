@@ -37,7 +37,6 @@ impl PreferencesWindow {
 
     fn toggle_recording(&mut self, _: &ToggleRecording, _window: &mut Window, cx: &mut Context<Self>) {
         if self.recording {
-            // Cancel recording
             self.recording = false;
             self.recorded_key_code = None;
             self.recorded_modifiers = 0;
@@ -64,19 +63,16 @@ impl PreferencesWindow {
             display_string: display,
         };
 
-        // Update global preferences
         let mut prefs = cx.global::<Preferences>().clone();
         prefs.hotkey = new_config.clone();
         cx.set_global(prefs.clone());
         save_preferences(&prefs);
 
-        // Re-register the hotkey
         #[cfg(target_os = "macos")]
         unsafe {
             hotkey::re_register_hotkey(key_code, modifiers);
         }
 
-        // Update local state
         self.current_hotkey = new_config;
         self.recording = false;
         self.recorded_key_code = None;
@@ -92,7 +88,6 @@ impl PreferencesWindow {
 
         let keystroke = &event.keystroke;
 
-        // Require at least one modifier
         if !keystroke.modifiers.platform
             && !keystroke.modifiers.alt
             && !keystroke.modifiers.control
@@ -100,27 +95,24 @@ impl PreferencesWindow {
             return;
         }
 
-        // Convert GPUI key name to Carbon virtual key code
         let Some(vk) = gpui_key_to_vk(&keystroke.key) else {
             return;
         };
 
-        // Convert GPUI modifiers to Carbon modifiers
         let mut carbon_mods: u32 = 0;
         if keystroke.modifiers.platform {
-            carbon_mods |= 1 << 8; // cmdKey
+            carbon_mods |= 1 << 8;
         }
         if keystroke.modifiers.shift {
-            carbon_mods |= 1 << 9; // shiftKey
+            carbon_mods |= 1 << 9;
         }
         if keystroke.modifiers.alt {
-            carbon_mods |= 1 << 11; // optionKey
+            carbon_mods |= 1 << 11;
         }
         if keystroke.modifiers.control {
-            carbon_mods |= 1 << 12; // controlKey
+            carbon_mods |= 1 << 12;
         }
 
-        // Build display string
         let mut display = String::new();
         if keystroke.modifiers.control {
             display.push_str("Ctrl+");
@@ -151,14 +143,12 @@ impl Render for PreferencesWindow {
         let recording = self.recording;
 
         let hotkey_display = if recording {
-            "Press a key combo...".to_string()
+            "Waiting for input...".to_string()
         } else if has_recorded {
             self.recorded_display.clone()
         } else {
             self.current_hotkey.display_string.clone()
         };
-
-        let record_label = if recording { "Cancel" } else { "Record" };
 
         div()
             .key_context("PreferencesWindow")
@@ -170,89 +160,99 @@ impl Render for PreferencesWindow {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.base)
+            .bg(theme.mantle)
             .text_color(theme.text)
             .child(
-                // Title bar area
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w_full()
-                    .h(px(40.))
-                    .border_b_1()
-                    .border_color(theme.surface0)
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(theme.subtext1)
-                            .child("Preferences"),
-                    ),
-            )
-            .child(
-                // Content
+                // Main content area with generous padding
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .p(px(20.))
-                    .gap(px(16.))
-                    // Hotkey section
+                    .p(px(24.))
+                    .gap(px(20.))
+                    // Section: Global Hotkey
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme.subtext0)
-                                    .child("Global Hotkey"),
-                            )
+                            .gap(px(10.))
+                            // Section header
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap(px(8.))
-                                    // Hotkey display box
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.overlay0)
+                                            .child("GLOBAL HOTKEY"),
+                                    ),
+                            )
+                            // Hotkey row: display + button
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .p(px(12.))
+                                    .rounded(px(8.))
+                                    .bg(theme.base)
+                                    .border_1()
+                                    .border_color(if recording {
+                                        theme.accent
+                                    } else {
+                                        theme.surface0
+                                    })
+                                    // Hotkey badge
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_1()
                                             .items_center()
-                                            .justify_center()
-                                            .h(px(32.))
-                                            .px(px(12.))
-                                            .rounded(px(6.))
-                                            .bg(theme.surface0)
-                                            .border_1()
-                                            .border_color(if recording {
-                                                theme.accent
-                                            } else {
-                                                theme.surface1
-                                            })
-                                            .text_size(px(13.))
-                                            .text_color(if recording {
-                                                theme.overlay0
-                                            } else {
-                                                theme.text
-                                            })
-                                            .child(hotkey_display),
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .h(px(28.))
+                                                    .px(px(10.))
+                                                    .rounded(px(5.))
+                                                    .bg(if recording {
+                                                        theme.surface0
+                                                    } else {
+                                                        theme.surface1
+                                                    })
+                                                    .text_size(px(12.))
+                                                    .text_color(if recording {
+                                                        theme.overlay1
+                                                    } else {
+                                                        theme.text
+                                                    })
+                                                    .child(hotkey_display),
+                                            ),
                                     )
-                                    // Record button
+                                    // Action button
                                     .child(
                                         div()
                                             .id("record-btn")
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .h(px(32.))
+                                            .h(px(28.))
                                             .px(px(12.))
-                                            .rounded(px(6.))
-                                            .bg(theme.surface1)
+                                            .rounded(px(5.))
+                                            .bg(if recording {
+                                                theme.surface2
+                                            } else {
+                                                theme.surface1
+                                            })
                                             .hover(|s| s.bg(theme.surface2))
                                             .cursor(CursorStyle::PointingHand)
-                                            .text_size(px(13.))
+                                            .text_size(px(12.))
+                                            .text_color(theme.subtext0)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.toggle_recording(
                                                     &ToggleRecording,
@@ -260,45 +260,78 @@ impl Render for PreferencesWindow {
                                                     cx,
                                                 );
                                             }))
-                                            .child(record_label),
+                                            .child(if recording { "Cancel" } else { "Record" }),
                                     ),
+                            )
+                            // Helper text
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.overlay0)
+                                    .child(if recording {
+                                        "Press a key combination with at least one modifier (Cmd, Alt, Ctrl)"
+                                    } else if has_recorded {
+                                        "New hotkey recorded. Save to apply."
+                                    } else {
+                                        "Click Record to change the hotkey"
+                                    }),
                             ),
                     )
-                    // Save button (visible when there's a recorded combo)
-                    .when(has_recorded, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .child(
-                                    div()
-                                        .id("save-btn")
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .h(px(32.))
-                                        .px(px(16.))
-                                        .rounded(px(6.))
-                                        .bg(theme.accent)
-                                        .hover(|s| s.opacity(0.9))
-                                        .cursor(CursorStyle::PointingHand)
-                                        .text_size(px(13.))
-                                        .text_color(gpui::white())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.save(&SavePreferences, window, cx);
-                                        }))
-                                        .child("Save"),
-                                ),
-                        )
-                    })
                     // Error display
                     .when_some(get_hotkey_error(), |el, err| {
                         el.child(
                             div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .p(px(10.))
+                                .rounded(px(6.))
+                                .bg(rgba(0xf3838320))
+                                .border_1()
+                                .border_color(rgba(0xf3838340))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(0xf38383))
+                                        .child(err),
+                                ),
+                        )
+                    }),
+            )
+            // Bottom bar
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .w_full()
+                    .h(px(48.))
+                    .px(px(24.))
+                    .border_t_1()
+                    .border_color(theme.surface0)
+                    .bg(theme.base)
+                    .gap(px(8.))
+                    .when(has_recorded, |el| {
+                        el.child(
+                            div()
+                                .id("save-btn")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(28.))
+                                .px(px(14.))
+                                .rounded(px(5.))
+                                .bg(theme.accent)
+                                .hover(|s| s.opacity(0.85))
+                                .cursor(CursorStyle::PointingHand)
                                 .text_size(px(12.))
-                                .text_color(gpui::red())
-                                .child(err),
+                                .text_color(gpui::white())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save(&SavePreferences, window, cx);
+                                }))
+                                .child("Save"),
                         )
                     }),
             )
