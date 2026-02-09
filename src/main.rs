@@ -201,10 +201,6 @@ fn main() {
             .open_window(options, |window, cx| {
                 cx.new(|cx| {
                     let popup = PopupEditor::new(cx);
-                    // Register focus handler to reset editor with clipboard on show
-                    popup.editor.update(cx, |editor, cx| {
-                        editor.register_focus_handler(window, cx);
-                    });
                     // Focus the editor
                     let focus = popup.editor.read(cx).focus_handle.clone();
                     window.focus(&focus, cx);
@@ -262,6 +258,25 @@ fn main() {
                         cx.update(|cx| {
                             open_preferences_window(cx);
                         });
+                    }
+                }
+            })
+            .detach();
+
+            // Poll for show-window requests: set editor text first, then show
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(10))
+                        .await;
+                    if hotkey::is_show_requested() {
+                        let clipboard_text = hotkey::take_pending_clipboard();
+                        window_handle.update(cx, |root: &mut PopupEditor, _window, cx| {
+                            root.editor.update(cx, |editor, cx| {
+                                editor.reset_with_text(clipboard_text, cx);
+                            });
+                        }).ok();
+                        unsafe { hotkey::show_window_now() };
                     }
                 }
             })

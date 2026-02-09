@@ -133,8 +133,6 @@ pub struct MultiLineEditor {
     pub cursor_fading_in: bool,
     pub blink_epoch: usize,
     pub fade_start: Option<Instant>,
-    // Subscriptions
-    _subscriptions: Vec<Subscription>,
 }
 
 impl MultiLineEditor {
@@ -155,43 +153,18 @@ impl MultiLineEditor {
             cursor_fading_in: true,
             blink_epoch: 0,
             fade_start: None,
-            _subscriptions: Vec::new(),
         };
         editor.reset_cursor_blink(cx);
         editor
     }
 
-    /// Register focus handler (must be called where Window is available).
-    pub fn register_focus_handler(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sub = cx.on_focus(&self.focus_handle, window, |this: &mut Self, _window, cx| {
-            this.reset_with_clipboard(cx);
-        });
-        self._subscriptions.push(sub);
-    }
-
-    /// Reset editor contents: load text from clipboard if available, otherwise empty.
-    fn reset_with_clipboard(&mut self, cx: &mut Context<Self>) {
-        // Try pre-fetched clipboard first (set by hotkey::toggle_window via NSPasteboard)
-        // Falls back to GPUI clipboard if not available
-        #[cfg(target_os = "macos")]
-        let clipboard_text = crate::hotkey::take_pending_clipboard()
-            .or_else(|| {
-                cx.read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .filter(|t| !t.is_empty())
-            });
-        #[cfg(not(target_os = "macos"))]
-        let clipboard_text = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .filter(|t| !t.is_empty());
-
-        if let Some(text) = clipboard_text {
+    /// Reset editor contents with the given text, or empty if None.
+    pub fn reset_with_text(&mut self, text: Option<String>, cx: &mut Context<Self>) {
+        if let Some(text) = text {
             let new_lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
             let last_line = new_lines.len() - 1;
             let last_col = new_lines[last_line].len();
             self.lines = new_lines;
-            // Select all text
             self.cursors = vec![Cursor {
                 position: CursorPosition::new(last_line, last_col),
                 anchor: Some(CursorPosition::new(0, 0)),

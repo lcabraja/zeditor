@@ -100,6 +100,7 @@ static GLOBAL_HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_MENU: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static OPEN_PREFS_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_CLIPBOARD: Mutex<Option<String>> = Mutex::new(None);
@@ -126,6 +127,33 @@ fn set_error(err: Option<String>) {
 /// This is used by the editor to avoid the slow GPUI clipboard read.
 pub fn take_pending_clipboard() -> Option<String> {
     PENDING_CLIPBOARD.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Check if a show-window was requested (hotkey pressed while hidden).
+/// Atomically swaps the flag and returns the old value.
+pub fn is_show_requested() -> bool {
+    SHOW_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// Actually show the window. Called from the GPUI side after the editor text has been set.
+///
+/// # Safety
+/// Must be called from the main thread.
+pub unsafe fn show_window_now() {
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+    if ns_window.is_null() || visible_ptr.is_null() {
+        return;
+    }
+
+    let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+
+    let _: () = msg_send![ns_window, center];
+    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+    let _: () = msg_send![ns_window, orderFrontRegardless];
+
+    (*visible_ptr).store(true, Ordering::SeqCst);
 }
 
 /// Read the system clipboard directly via NSPasteboard.
@@ -604,6 +632,7 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
             *pending = clipboard_text;
         }
 
+        // Remember the previous frontmost app for focus restoration on hide
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let frontmost_app: id = msg_send![workspace, frontmostApplication];
         if !frontmost_app.is_null() {
@@ -614,14 +643,8 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
             }
         }
 
-        let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
-
-        let _: () = msg_send![ns_window, center];
-        let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
-        let _: () = msg_send![ns_window, orderFrontRegardless];
-
-        visible.store(true, Ordering::SeqCst);
+        // Signal the GPUI polling task to set editor text, then show
+        SHOW_REQUESTED.store(true, Ordering::SeqCst);
     }
 }
 
