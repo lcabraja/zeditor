@@ -6,14 +6,11 @@ use cocoa::foundation::NSString;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Carbon Event constants
-const K_VK_ANSI_E: u32 = 0x0E; // Virtual key code for 'E'
 const K_VK_ESCAPE: u16 = 0x35; // Virtual key code for Escape
-const CMD_KEY: u32 = 1 << 8; // cmdKey modifier
-const SHIFT_KEY: u32 = 1 << 9; // shiftKey modifier
 const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962; // 'keyb'
 const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
 const K_EVENT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D2D2D; // '----'
@@ -67,6 +64,7 @@ unsafe extern "C" {
         in_options: u32,
         out_ref: *mut EventHotKeyRef,
     ) -> OSStatus;
+    fn UnregisterEventHotKey(in_ref: EventHotKeyRef) -> OSStatus;
     fn InstallEventHandler(
         in_target: EventTargetRef,
         in_handler: EventHandlerProcPtr,
@@ -93,151 +91,219 @@ unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: id) -> bool;
 }
 
-/// Registers a global hotkey using Carbon Events (Cmd+Shift+E).
-/// Also disables window animation and creates a status bar item.
+// Global state
+static GLOBAL_STATUS_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_VISIBLE: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_PREVIOUS_APP: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_MENU: AtomicUsize = AtomicUsize::new(0);
+static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+static OPEN_PREFS_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+static GLOBAL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Check if the preferences window was requested from the menu.
+/// Atomically swaps the flag and returns the old value.
+pub fn is_prefs_requested() -> bool {
+    OPEN_PREFS_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// Get the current error message, if any.
+pub fn get_error() -> Option<String> {
+    GLOBAL_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_error(err: Option<String>) {
+    if let Ok(mut g) = GLOBAL_ERROR.lock() {
+        *g = err;
+    }
+    unsafe { update_menu_error() };
+}
+
+fn version_string() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    if version == "0.1.0" {
+        format!(
+            "Zeditor dev ({}, {})",
+            env!("GIT_COMMIT"),
+            env!("BUILD_DATE")
+        )
+    } else {
+        format!("Zeditor v{}", version)
+    }
+}
+
+/// Registers a global hotkey using Carbon Events.
+/// Also disables window animation and creates a status bar item with menu.
 ///
 /// # Safety
 /// `ns_window` must be a valid NSWindow/NSPanel pointer that outlives the monitors.
-pub unsafe fn register_hotkey(ns_window: *mut Object) {
+pub unsafe fn register_hotkey(ns_window: *mut Object, key_code: u32, modifiers: u32) {
     // Check if we have accessibility permissions, prompt if not
-    let trusted = unsafe { AXIsProcessTrusted() };
+    let trusted = AXIsProcessTrusted();
     if !trusted {
         let key: id = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
         let yes_num: id = msg_send![class!(NSNumber), numberWithBool: true];
-        let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes_num forKey: key];
-        let _ = unsafe { AXIsProcessTrustedWithOptions(options) };
+        let options: id =
+            msg_send![class!(NSDictionary), dictionaryWithObject: yes_num forKey: key];
+        let _ = AXIsProcessTrustedWithOptions(options);
     }
 
     let visible = Arc::new(AtomicBool::new(false));
 
     // Disable window animation for instant show/hide
-    // SAFETY: ns_window is a valid NSWindow pointer per the function's safety contract
-    let _: () = unsafe { msg_send![ns_window, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE] };
+    let _: () = msg_send![ns_window, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE];
 
-    // Create status bar item (menu bar icon)
-    // SAFETY: ns_window is valid, and create_status_item's requirements are met
-    unsafe { create_status_item(ns_window, visible.clone()) };
+    // Create status bar item with menu
+    create_status_item(ns_window, visible.clone());
 
-    // Register Carbon global hotkey (Cmd+Shift+E)
-    // SAFETY: ns_window is valid, visible Arc is cloned
-    unsafe { register_carbon_hotkey(ns_window, visible.clone()) };
+    // Register Carbon global hotkey
+    register_carbon_hotkey(ns_window, visible.clone(), key_code, modifiers);
 
     // Register local ESC key monitor to hide window
-    // SAFETY: ns_window is valid, visible Arc is cloned
-    unsafe { register_escape_monitor(ns_window, visible.clone()) };
+    register_escape_monitor(ns_window, visible.clone());
 
     // Register for app deactivation to auto-hide window
-    // SAFETY: ns_window is valid, visible Arc is cloned
-    unsafe { register_deactivation_observer(ns_window, visible) };
+    register_deactivation_observer(ns_window, visible);
 }
 
-/// Registers a global hotkey using Carbon Event Manager.
-/// This is more reliable than NSEvent monitors for background apps.
+/// Re-registers the global hotkey with new key code and modifiers.
+/// Call this after the user changes the hotkey in preferences.
 ///
 /// # Safety
-/// `ns_window` must be a valid NSWindow pointer that outlives the hotkey.
-unsafe fn register_carbon_hotkey(ns_window: *mut Object, visible: Arc<AtomicBool>) {
+/// Must be called from the main thread after `register_hotkey` has been called.
+pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
+    // Unregister old hotkey
+    let old_ref = GLOBAL_HOTKEY_REF.swap(0, Ordering::SeqCst) as EventHotKeyRef;
+    if !old_ref.is_null() {
+        UnregisterEventHotKey(old_ref);
+    }
+
+    // Register new hotkey
+    let hotkey_id = EventHotKeyID {
+        signature: 0x5A454449, // 'ZEDI'
+        id: 1,
+    };
+    let event_target = GetEventDispatcherTarget();
+    let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
+    let status = RegisterEventHotKey(
+        key_code,
+        modifiers,
+        hotkey_id,
+        event_target,
+        0,
+        &mut hotkey_ref,
+    );
+
+    if status != 0 {
+        set_error(Some(format!(
+            "Hotkey registration failed (status: {})",
+            status
+        )));
+    } else {
+        GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
+        set_error(None);
+    }
+}
+
+unsafe fn register_carbon_hotkey(
+    ns_window: *mut Object,
+    visible: Arc<AtomicBool>,
+    key_code: u32,
+    modifiers: u32,
+) {
     // Store in globals for the callback
     GLOBAL_WINDOW.store(ns_window as usize, Ordering::SeqCst);
     GLOBAL_VISIBLE.store(Box::into_raw(Box::new(visible)) as usize, Ordering::SeqCst);
 
-    // Define the hotkey ID
     let hotkey_id = EventHotKeyID {
-        signature: 0x5A454449, // 'ZEDI' - unique signature for our app
+        signature: 0x5A454449, // 'ZEDI'
         id: 1,
     };
 
-    // Get the event dispatcher target
-    // SAFETY: Carbon API call, returns valid target
-    let event_target = unsafe { GetEventDispatcherTarget() };
+    let event_target = GetEventDispatcherTarget();
 
-    // Register the hotkey: Cmd+Shift+E
+    // Register the hotkey
     let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
-    // SAFETY: Carbon API call with valid parameters
-    let status = unsafe {
-        RegisterEventHotKey(
-            K_VK_ANSI_E,
-            CMD_KEY | SHIFT_KEY,
-            hotkey_id,
-            event_target,
-            0,
-            &mut hotkey_ref,
-        )
-    };
+    let status = RegisterEventHotKey(
+        key_code,
+        modifiers,
+        hotkey_id,
+        event_target,
+        0,
+        &mut hotkey_ref,
+    );
 
     if status != 0 {
-        eprintln!("RegisterEventHotKey failed with status: {}", status);
-        return;
+        set_error(Some(format!(
+            "Hotkey registration failed (status: {})",
+            status
+        )));
+    } else {
+        GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
     }
 
-    // Install the event handler
-    let event_type = EventTypeSpec {
-        event_class: K_EVENT_CLASS_KEYBOARD,
-        event_kind: K_EVENT_HOT_KEY_PRESSED,
-    };
+    // Install the event handler (only once)
+    if !HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        let event_type = EventTypeSpec {
+            event_class: K_EVENT_CLASS_KEYBOARD,
+            event_kind: K_EVENT_HOT_KEY_PRESSED,
+        };
 
-    let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
-    // SAFETY: Carbon API call with valid parameters
-    let status = unsafe {
-        InstallEventHandler(
+        let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
+        let status = InstallEventHandler(
             event_target,
             hotkey_handler,
             1,
             &event_type,
             std::ptr::null_mut(),
             &mut handler_ref,
-        )
-    };
+        );
 
-    if status != 0 {
-        eprintln!("InstallEventHandler failed with status: {}", status);
+        if status != 0 {
+            eprintln!("InstallEventHandler failed with status: {}", status);
+        }
     }
 }
 
-/// Registers a local event monitor for the ESC key to hide the window.
-///
-/// # Safety
-/// `ns_window` must be a valid NSWindow pointer that outlives the monitor.
 unsafe fn register_escape_monitor(ns_window: *mut Object, visible: Arc<AtomicBool>) {
-    let ns_window = ns_window as usize; // make it Send
+    let ns_window = ns_window as usize;
 
     let handler = block::ConcreteBlock::new(move |event: id| -> id {
         unsafe {
             let key_code: u16 = msg_send![event, keyCode];
             if key_code == K_VK_ESCAPE && visible.load(Ordering::SeqCst) {
-                // ESC pressed while window is visible - hide it
                 let ns_window = ns_window as *mut Object;
                 let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
                 if !visible_ptr.is_null() {
                     hide_window(ns_window, &*visible_ptr);
                 }
-                return nil; // swallow the event
+                return nil;
             }
             event
         }
     });
     let handler = handler.copy();
 
-    // SAFETY: NSEvent class exists and the handler block is valid
-    let _: id = unsafe {
-        msg_send![
-            class!(NSEvent),
-            addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-            handler: &*handler
-        ]
-    };
+    let _: id = msg_send![
+        class!(NSEvent),
+        addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
+        handler: &*handler
+    ];
     std::mem::forget(handler);
 }
 
-/// Carbon event handler callback for hotkey presses.
 extern "C" fn hotkey_handler(
     _handler: EventHandlerRef,
     event: EventRef,
     _user_data: *mut c_void,
 ) -> OSStatus {
     unsafe {
-        // Get the hotkey ID from the event
-        let mut hotkey_id = EventHotKeyID { signature: 0, id: 0 };
+        let mut hotkey_id = EventHotKeyID {
+            signature: 0,
+            id: 0,
+        };
         let status = GetEventParameter(
             event,
             K_EVENT_PARAM_DIRECT_OBJECT,
@@ -249,7 +315,6 @@ extern "C" fn hotkey_handler(
         );
 
         if status == 0 && hotkey_id.id == 1 {
-            // Our hotkey was pressed - toggle the window
             let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
             let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
             if !visible_ptr.is_null() && !ns_window.is_null() {
@@ -257,19 +322,13 @@ extern "C" fn hotkey_handler(
             }
         }
     }
-    0 // noErr
+    0
 }
 
-/// Registers an observer for NSApplicationDidResignActiveNotification.
-/// When the app loses focus, the window is automatically hidden.
-///
-/// # Safety
-/// `ns_window` must be a valid NSWindow pointer that outlives the observer.
 unsafe fn register_deactivation_observer(ns_window: *mut Object, visible: Arc<AtomicBool>) {
-    let ns_window = ns_window as usize; // make it Send
+    let ns_window = ns_window as usize;
 
     let handler = block::ConcreteBlock::new(move |_notification: id| {
-        // When app loses focus, hide the window
         if visible.load(Ordering::SeqCst) {
             unsafe {
                 let ns_window = ns_window as *mut Object;
@@ -280,87 +339,100 @@ unsafe fn register_deactivation_observer(ns_window: *mut Object, visible: Arc<At
     });
     let handler = handler.copy();
 
-    // Get the default notification center
-    // SAFETY: NSNotificationCenter class exists on macOS
-    let notification_center: id =
-        unsafe { msg_send![class!(NSNotificationCenter), defaultCenter] };
-
-    // Create the notification name string
-    // SAFETY: NSString::alloc and init_str are safe
+    let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
     let notification_name =
-        unsafe { NSString::alloc(nil).init_str(NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION) };
+        NSString::alloc(nil).init_str(NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION);
 
-    // Register the observer
-    // SAFETY: notification_center is valid, handler block is valid
-    let _: id = unsafe {
-        msg_send![
-            notification_center,
-            addObserverForName: notification_name
-            object: nil
-            queue: nil
-            usingBlock: &*handler
-        ]
-    };
+    let _: id = msg_send![
+        notification_center,
+        addObserverForName: notification_name
+        object: nil
+        queue: nil
+        usingBlock: &*handler
+    ];
 
     std::mem::forget(handler);
 }
 
 unsafe fn create_status_item(ns_window: *mut Object, visible: Arc<AtomicBool>) {
-    // Get the system status bar
-    // SAFETY: NSStatusBar class exists on macOS
-    let status_bar: id = unsafe { msg_send![class!(NSStatusBar), systemStatusBar] };
-
-    // Create a status item with variable length
-    // SAFETY: status_bar is a valid NSStatusBar instance
+    let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
     let status_item: id =
-        unsafe { msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH] };
+        msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH];
 
-    // Get the button from the status item
-    // SAFETY: status_item is a valid NSStatusItem instance
-    let button: id = unsafe { msg_send![status_item, button] };
+    let button: id = msg_send![status_item, button];
+    let title = NSString::alloc(nil).init_str("Z");
+    let _: () = msg_send![button, setTitle: title];
 
-    // Set the title to a simple "Z" character (or could use an SF Symbol)
-    // SAFETY: NSString::alloc and init_str are safe with valid nil argument
-    let title = unsafe { NSString::alloc(nil).init_str("Z") };
-    // SAFETY: button is a valid NSStatusBarButton instance
-    let _: () = unsafe { msg_send![button, setTitle: title] };
+    // Retain the status item to prevent deallocation
+    let _: id = msg_send![status_item, retain];
 
-    // Store the status item to prevent it from being released
-    // We'll use statics to keep references alive
     let ns_window = ns_window as usize;
     GLOBAL_STATUS_ITEM.store(status_item as usize, Ordering::SeqCst);
     GLOBAL_WINDOW.store(ns_window, Ordering::SeqCst);
     GLOBAL_VISIBLE.store(Box::into_raw(Box::new(visible)) as usize, Ordering::SeqCst);
 
-    // Set up click handling via NSButton's action
-    // We need to create an Objective-C object to receive the action
-    // SAFETY: button is a valid NSStatusBarButton instance
-    unsafe { setup_status_button_action(button) };
+    // Set up the NSMenu
+    setup_status_menu(status_item);
+
+    // Ensure visible
+    let _: () = msg_send![status_item, setVisible: true];
 }
 
-// Global state for the status item callback and hotkey handler
-static GLOBAL_STATUS_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static GLOBAL_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static GLOBAL_VISIBLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-// Store the previously focused app to restore focus when hiding
-static GLOBAL_PREVIOUS_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-unsafe fn setup_status_button_action(button: id) {
+unsafe fn setup_status_menu(status_item: id) {
     use objc::declare::ClassDecl;
     use objc::runtime::{Class, Sel};
 
-    // Check if we already registered the class
-    let class_name = "ZeditorStatusTarget";
-    let existing = Class::get(class_name);
+    // Create the menu
+    let menu: id = msg_send![class!(NSMenu), alloc];
+    let menu: id = msg_send![menu, initWithTitle: NSString::alloc(nil).init_str("")];
 
-    let target_class = if let Some(cls) = existing {
+    // 1. Version item (disabled, gray)
+    let version_str = version_string();
+    let version_title = NSString::alloc(nil).init_str(&version_str);
+    let version_item: id = msg_send![class!(NSMenuItem), alloc];
+    let version_item: id = msg_send![
+        version_item,
+        initWithTitle: version_title
+        action: std::ptr::null::<Sel>()
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let _: () = msg_send![version_item, setEnabled: false];
+    let _: () = msg_send![version_item, setTag: 50i64];
+    let _: () = msg_send![menu, addItem: version_item];
+
+    // Separator
+    let sep: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: sep];
+
+    // 2. Error item (hidden by default)
+    let error_title = NSString::alloc(nil).init_str("");
+    let error_item: id = msg_send![class!(NSMenuItem), alloc];
+    let error_item: id = msg_send![
+        error_item,
+        initWithTitle: error_title
+        action: std::ptr::null::<Sel>()
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let _: () = msg_send![error_item, setEnabled: false];
+    let _: () = msg_send![error_item, setTag: 100i64];
+    let _: () = msg_send![error_item, setHidden: true];
+    let _: () = msg_send![menu, addItem: error_item];
+
+    // Error separator (hidden by default)
+    let error_sep: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![error_sep, setTag: 101i64];
+    let _: () = msg_send![error_sep, setHidden: true];
+    let _: () = msg_send![menu, addItem: error_sep];
+
+    // 3. Toggle Editor
+    let class_name = "ZeditorMenuTarget";
+    let target_class = if let Some(cls) = Class::get(class_name) {
         cls
     } else {
-        // Create a new Objective-C class to handle the click
         let superclass = Class::get("NSObject").unwrap();
         let mut decl = ClassDecl::new(class_name, superclass).unwrap();
 
-        extern "C" fn handle_click(_self: &Object, _cmd: Sel, _sender: id) {
+        extern "C" fn menu_toggle(_self: &Object, _cmd: Sel, _sender: id) {
             unsafe {
                 let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
                 let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
@@ -370,28 +442,114 @@ unsafe fn setup_status_button_action(button: id) {
             }
         }
 
-        // SAFETY: Adding a method to a class being declared, with valid selector and fn pointer
-        unsafe {
-            decl.add_method(
-                sel!(statusItemClicked:),
-                handle_click as extern "C" fn(&Object, Sel, id),
-            );
+        extern "C" fn menu_preferences(_self: &Object, _cmd: Sel, _sender: id) {
+            OPEN_PREFS_REQUESTED.store(true, Ordering::SeqCst);
+            unsafe {
+                let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+            }
         }
+
+        extern "C" fn menu_quit(_self: &Object, _cmd: Sel, _sender: id) {
+            unsafe {
+                let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![ns_app, terminate: nil];
+            }
+        }
+
+        decl.add_method(
+            sel!(menuToggle:),
+            menu_toggle as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(menuPreferences:),
+            menu_preferences as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(menuQuit:),
+            menu_quit as extern "C" fn(&Object, Sel, id),
+        );
 
         decl.register()
     };
 
-    // Create an instance of our target class
-    // SAFETY: target_class is a valid registered ObjC class
-    let target: id = unsafe { msg_send![target_class, new] };
+    let target: id = msg_send![target_class, new];
 
-    // Set the button's target and action
-    // SAFETY: button is a valid NSStatusBarButton, target is a valid ObjC object
-    let _: () = unsafe { msg_send![button, setTarget: target] };
-    let _: () = unsafe { msg_send![button, setAction: sel!(statusItemClicked:)] };
+    let toggle_title = NSString::alloc(nil).init_str("Toggle Editor");
+    let toggle_item: id = msg_send![class!(NSMenuItem), alloc];
+    let toggle_item: id = msg_send![
+        toggle_item,
+        initWithTitle: toggle_title
+        action: sel!(menuToggle:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let _: () = msg_send![toggle_item, setTarget: target];
+    let _: () = msg_send![toggle_item, setTag: 200i64];
+    let _: () = msg_send![menu, addItem: toggle_item];
 
-    // Note: target is a raw pointer (Copy type), so we don't need mem::forget.
-    // The ObjC runtime retains it via setTarget:.
+    // Separator
+    let sep2: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: sep2];
+
+    // 4. Preferences...
+    let prefs_title = NSString::alloc(nil).init_str("Preferences...");
+    let prefs_item: id = msg_send![class!(NSMenuItem), alloc];
+    let prefs_item: id = msg_send![
+        prefs_item,
+        initWithTitle: prefs_title
+        action: sel!(menuPreferences:)
+        keyEquivalent: NSString::alloc(nil).init_str(",")
+    ];
+    let _: () = msg_send![prefs_item, setTarget: target];
+    let _: () = msg_send![prefs_item, setTag: 300i64];
+    let _: () = msg_send![menu, addItem: prefs_item];
+
+    // Separator
+    let sep3: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: sep3];
+
+    // 5. Quit Zeditor
+    let quit_title = NSString::alloc(nil).init_str("Quit Zeditor");
+    let quit_item: id = msg_send![class!(NSMenuItem), alloc];
+    let quit_item: id = msg_send![
+        quit_item,
+        initWithTitle: quit_title
+        action: sel!(menuQuit:)
+        keyEquivalent: NSString::alloc(nil).init_str("q")
+    ];
+    let _: () = msg_send![quit_item, setTarget: target];
+    let _: () = msg_send![quit_item, setTag: 400i64];
+    let _: () = msg_send![menu, addItem: quit_item];
+
+    // Store menu pointer for later updates (before attaching)
+    GLOBAL_MENU.store(menu as usize, Ordering::SeqCst);
+
+    // Attach menu to status item
+    let _: () = msg_send![status_item, setMenu: menu];
+}
+
+unsafe fn update_menu_error() {
+    let menu = GLOBAL_MENU.load(Ordering::SeqCst) as id;
+    if menu.is_null() {
+        return;
+    }
+
+    let error_item: id = msg_send![menu, itemWithTag: 100i64];
+    let error_sep: id = msg_send![menu, itemWithTag: 101i64];
+
+    if error_item.is_null() || error_sep.is_null() {
+        return;
+    }
+
+    if let Some(err) = get_error() {
+        let title = NSString::alloc(nil).init_str(&format!("⚠ {}", err));
+        let _: () = msg_send![error_item, setTitle: title];
+        let _: () = msg_send![error_item, setHidden: false];
+        let _: () = msg_send![error_sep, setHidden: false];
+    } else {
+        let _: () = msg_send![error_item, setHidden: true];
+        let _: () = msg_send![error_sep, setHidden: true];
+    }
 }
 
 /// Hides the window and restores focus to the previous app.
@@ -400,59 +558,43 @@ unsafe fn setup_status_button_action(button: id) {
 /// `ns_window` must be a valid NSWindow pointer.
 pub unsafe fn hide_window(ns_window: *mut Object, visible: &AtomicBool) {
     if !visible.load(Ordering::SeqCst) {
-        return; // Already hidden
+        return;
     }
 
-    // Hide the window
     let _: () = msg_send![ns_window, orderOut: nil];
     visible.store(false, Ordering::SeqCst);
 
-    // Restore focus to the previous app
     let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
     if !prev_app.is_null() {
-        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
-        // Release the retained app reference
         let _: () = msg_send![prev_app, release];
     }
 }
 
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
-        // SAFETY: ns_window and visible are valid per function contract
-        unsafe { hide_window(ns_window, visible) };
+        hide_window(ns_window, visible);
     } else {
-        // Capture the currently focused app before showing our window
-        // SAFETY: NSWorkspace class exists on macOS
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let frontmost_app: id = msg_send![workspace, frontmostApplication];
         if !frontmost_app.is_null() {
-            // Retain it so it doesn't get deallocated
             let _: id = msg_send![frontmost_app, retain];
-            // Store the old value and release it if there was one
             let old = GLOBAL_PREVIOUS_APP.swap(frontmost_app as usize, Ordering::SeqCst) as id;
             if !old.is_null() {
                 let _: () = msg_send![old, release];
             }
         }
 
-        // Activate the application so it can receive keyboard focus
         let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
 
-        // Center on the screen
         let _: () = msg_send![ns_window, center];
-
-        // Make window key (for keyboard input) and bring to front
         let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
-
-        // Force to front
         let _: () = msg_send![ns_window, orderFrontRegardless];
 
         visible.store(true, Ordering::SeqCst);
     }
 }
-
 
 /// Submits text by copying to clipboard, hiding the window, restoring focus,
 /// and simulating Cmd+V to paste into the previous app.
@@ -460,25 +602,23 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
 /// # Safety
 /// Must be called from the main thread with a valid ns_window pointer.
 pub unsafe fn submit_and_paste(text: &str) {
-    // Wrap in catch_unwind to prevent panics from propagating across FFI
     let text = text.to_string();
-    let result = std::panic::catch_unwind(move || {
-        unsafe { submit_and_paste_inner(&text) }
-    });
+    let result = std::panic::catch_unwind(move || unsafe { submit_and_paste_inner(&text) });
     if let Err(e) = result {
         eprintln!("[submit_and_paste] Panic: {:?}", e);
     }
 }
 
+// Store app to release after paste
+static PENDING_RELEASE_APP: AtomicUsize = AtomicUsize::new(0);
+
 unsafe fn submit_and_paste_inner(text: &str) {
-    // Copy text to the system clipboard
     let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
     let _: () = msg_send![pasteboard, clearContents];
     let ns_string: id = NSString::alloc(nil).init_str(text);
     let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
     let _: bool = msg_send![pasteboard, setString: ns_string forType: string_type];
 
-    // Hide the window
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
     let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
@@ -488,25 +628,18 @@ unsafe fn submit_and_paste_inner(text: &str) {
         (*visible_ptr).store(false, Ordering::SeqCst);
     }
 
-    // Activate the previous app
     if !prev_app.is_null() {
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
         PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
     }
 
-    // Schedule paste after a short delay
     schedule_paste_with_delay();
 }
 
-// Store app to release after paste
-static PENDING_RELEASE_APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Schedules the paste operation using NSTimer
 unsafe fn schedule_paste_with_delay() {
     use objc::declare::ClassDecl;
     use objc::runtime::{Class, Sel};
 
-    // Create or get our helper class
     let class_name = "ZeditorPasteHelper";
     let helper_class = if let Some(cls) = Class::get(class_name) {
         cls
@@ -521,16 +654,12 @@ unsafe fn schedule_paste_with_delay() {
         };
 
         extern "C" fn do_paste(_self: &Object, _cmd: Sel) {
-            // Catch panics to avoid unwinding across FFI
-            let result = std::panic::catch_unwind(|| {
-                unsafe {
-                    simulate_paste();
+            let result = std::panic::catch_unwind(|| unsafe {
+                simulate_paste();
 
-                    // Release the previous app reference
-                    let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
-                    if !prev_app.is_null() {
-                        let _: () = msg_send![prev_app, release];
-                    }
+                let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
+                if !prev_app.is_null() {
+                    let _: () = msg_send![prev_app, release];
                 }
             });
             if let Err(e) = result {
@@ -538,30 +667,23 @@ unsafe fn schedule_paste_with_delay() {
             }
         }
 
-        unsafe {
-            decl.add_method(
-                sel!(doPaste),
-                do_paste as extern "C" fn(&Object, Sel),
-            );
-        }
+        decl.add_method(
+            sel!(doPaste),
+            do_paste as extern "C" fn(&Object, Sel),
+        );
 
         decl.register()
     };
 
-    // Create instance and schedule
-    let helper: id = unsafe { msg_send![helper_class, new] };
-    let _: () = unsafe {
-        msg_send![
-            helper,
-            performSelector: sel!(doPaste)
-            withObject: nil
-            afterDelay: 0.05f64
-        ]
-    };
-    // Note: performSelector retains the object until after the delay
+    let helper: id = msg_send![helper_class, new];
+    let _: () = msg_send![
+        helper,
+        performSelector: sel!(doPaste)
+        withObject: nil
+        afterDelay: 0.05f64
+    ];
 }
 
-/// Simulates Cmd+V keypress using CGEvent to paste into the frontmost app.
 unsafe fn simulate_paste() {
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -586,7 +708,6 @@ unsafe fn simulate_paste() {
         return;
     }
 
-    // Key down
     let key_down = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true);
     if !key_down.is_null() {
         CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
@@ -594,7 +715,6 @@ unsafe fn simulate_paste() {
         CFRelease(key_down);
     }
 
-    // Key up
     let key_up = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false);
     if !key_up.is_null() {
         CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
@@ -604,4 +724,3 @@ unsafe fn simulate_paste() {
 
     CFRelease(source);
 }
-

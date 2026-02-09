@@ -2,11 +2,15 @@ mod assets;
 mod editor;
 #[cfg(target_os = "macos")]
 mod hotkey;
+mod preferences;
+mod preferences_window;
 mod theme;
 
 use assets::*;
 use editor::*;
 use gpui::*;
+use preferences::*;
+use preferences_window::*;
 use theme::*;
 
 #[cfg(target_os = "macos")]
@@ -152,9 +156,15 @@ fn main() {
             KeyBinding::new("cmd-v", Paste, Some("MultiLineEditor")),
             KeyBinding::new("cmd-c", Copy, Some("MultiLineEditor")),
             KeyBinding::new("cmd-x", Cut, Some("MultiLineEditor")),
+            // Preferences window keybindings
+            KeyBinding::new("escape", ClosePreferences, Some("PreferencesWindow")),
+            KeyBinding::new("cmd-w", ClosePreferences, Some("PreferencesWindow")),
         ]);
 
         cx.on_action(quit);
+
+        // Initialize preferences (before theme, so hotkey config is available)
+        Preferences::init(cx);
 
         // Initialize theme
         Theme::init(cx);
@@ -205,6 +215,11 @@ fn main() {
                 ];
             }
 
+            // Read hotkey config from preferences
+            let prefs = cx.global::<Preferences>();
+            let key_code = prefs.hotkey.key_code;
+            let modifiers = prefs.hotkey.modifiers;
+
             // Get NSWindow from the GPUI window handle
             window_handle
                 .update(cx, |_root, window, _cx| {
@@ -213,20 +228,56 @@ fn main() {
                         if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw {
                             let ns_view = appkit.ns_view.as_ptr() as *mut objc::runtime::Object;
                             unsafe {
-                                // Get NSWindow from NSView
                                 let ns_window: *mut objc::runtime::Object =
                                     msg_send![ns_view, window];
-                                // Lower window level from NSPopUpWindowLevel (101)
-                                // to NSFloatingWindowLevel (3)
                                 let _: () = msg_send![ns_window, setLevel: 3i64];
-                                // Register global hotkey
-                                hotkey::register_hotkey(ns_window);
+                                hotkey::register_hotkey(ns_window, key_code, modifiers);
                             }
                         }
                     }
                 })
                 .ok();
+
+            // Poll for preferences window requests from the menu bar
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                    if hotkey::is_prefs_requested() {
+                        cx.update(|cx| {
+                            open_preferences_window(cx);
+                        });
+                    }
+                }
+            })
+            .detach();
         }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn open_preferences_window(cx: &mut App) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(400.), px(250.)),
+            cx,
+        ))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Preferences".into()),
+            ..Default::default()
+        }),
+        show: true,
+        focus: true,
+        kind: WindowKind::Normal,
+        ..Default::default()
+    };
+
+    let _ = cx.open_window(options, |_window, cx| {
+        cx.new(|cx| {
+            PreferencesWindow::new(cx)
+        })
     });
 }
 
