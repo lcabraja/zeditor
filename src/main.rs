@@ -22,12 +22,56 @@ actions!(popup_editor, [Quit, Escape, SubmitAndPaste, OpenPreferences]);
 
 pub struct PopupEditor {
     editor: Entity<MultiLineEditor>,
+    last_clipboard_hash: u64,
 }
 
 impl PopupEditor {
     fn new(cx: &mut Context<Self>) -> Self {
         let editor = cx.new(MultiLineEditor::new);
-        Self { editor }
+        Self {
+            editor,
+            last_clipboard_hash: 0,
+        }
+    }
+
+    /// Called when the window is about to show. Reads clipboard, checks if it
+    /// changed since last open. If changed, replaces editor contents. If same,
+    /// keeps existing editor state.
+    fn on_show(&mut self, cx: &mut Context<Self>) {
+        // Check for CLI/pipe initial text first
+        #[cfg(target_os = "macos")]
+        if let Some(initial_text) = hotkey::take_pending_clipboard() {
+            let hash = Self::hash_str(&initial_text);
+            self.last_clipboard_hash = hash;
+            self.editor.update(cx, |editor, cx| {
+                editor.reset_with_text(Some(initial_text), cx);
+            });
+            return;
+        }
+
+        let clipboard_text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text().map(|t| t.to_string()));
+
+        let current_hash = clipboard_text
+            .as_ref()
+            .map(|t| Self::hash_str(t))
+            .unwrap_or(0);
+
+        if current_hash != self.last_clipboard_hash {
+            self.last_clipboard_hash = current_hash;
+            self.editor.update(cx, |editor, cx| {
+                editor.reset_with_text(clipboard_text, cx);
+            });
+        }
+        // else: clipboard unchanged, keep editor contents
+    }
+
+    fn hash_str(s: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
@@ -103,7 +147,7 @@ impl Render for PopupEditor {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.overlay0)
-                            .child("Esc to close"),
+                            .child(self.editor.read(cx).status_text()),
                     ),
             )
             .child(
@@ -198,8 +242,8 @@ fn main() {
             KeyBinding::new("enter", Enter, Some("MultiLineEditor")),
             KeyBinding::new("alt-up", MoveLineUp, Some("MultiLineEditor")),
             KeyBinding::new("alt-down", MoveLineDown, Some("MultiLineEditor")),
-            KeyBinding::new("alt-shift-up", AddCursorUp, Some("MultiLineEditor")),
-            KeyBinding::new("alt-shift-down", AddCursorDown, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-alt-up", AddCursorUp, Some("MultiLineEditor")),
+            KeyBinding::new("cmd-alt-down", AddCursorDown, Some("MultiLineEditor")),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("MultiLineEditor")),
             KeyBinding::new("cmd-v", Paste, Some("MultiLineEditor")),
             KeyBinding::new("cmd-c", Copy, Some("MultiLineEditor")),
@@ -298,18 +342,15 @@ fn main() {
             })
             .detach();
 
-            // Poll for show-window requests: set editor text first, then show
+            // Poll for show-window requests: check clipboard, then show
             cx.spawn(async move |cx: &mut AsyncApp| {
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(10))
                         .await;
                     if hotkey::is_show_requested() {
-                        let clipboard_text = hotkey::take_pending_clipboard();
                         window_handle.update(cx, |root: &mut PopupEditor, _window, cx| {
-                            root.editor.update(cx, |editor, cx| {
-                                editor.reset_with_text(clipboard_text, cx);
-                            });
+                            root.on_show(cx);
                         }).ok();
                         unsafe { hotkey::show_window_now() };
                     }

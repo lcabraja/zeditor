@@ -136,6 +136,8 @@ pub struct MultiLineEditor {
     pub last_visual_line_counts: Vec<usize>,
     /// Set when cursor moves; cleared after paint applies scroll_to_cursor
     pub needs_scroll_to_cursor: bool,
+    /// Width of the line number gutter (set during paint)
+    pub last_gutter_width: Pixels,
     // Cursor blink state
     pub cursor_opacity: f32,
     pub cursor_fading_in: bool,
@@ -162,6 +164,7 @@ impl MultiLineEditor {
             last_max_line_width: px(0.),
             last_visual_line_counts: Vec::new(),
             needs_scroll_to_cursor: false,
+            last_gutter_width: px(0.),
             cursor_opacity: 1.0,
             cursor_fading_in: true,
             blink_epoch: 0,
@@ -231,6 +234,50 @@ impl MultiLineEditor {
     }
 
     // --- Public query methods ---
+
+    pub fn status_text(&self) -> String {
+        let c = &self.cursors[0];
+        let line = c.position.line + 1;
+        let col = c.position.col + 1;
+        let total_lines = self.lines.len();
+        let total_chars: usize = self.lines.iter().map(|l| l.len()).sum::<usize>() + self.lines.len().saturating_sub(1); // chars + newlines
+
+        // Check if there's a selection
+        let has_selection = self.cursors.iter().any(|c| c.has_selection());
+        if has_selection {
+            // Count selected characters across all cursors
+            let mut selected_chars = 0usize;
+            let mut selected_lines = std::collections::BTreeSet::new();
+            for c in &self.cursors {
+                if let Some((start, end)) = c.selection_range() {
+                    for l in start.line..=end.line {
+                        selected_lines.insert(l);
+                    }
+                    selected_chars += self.text_in_range(&start, &end).len();
+                }
+            }
+            let sel_lines = selected_lines.len();
+            format!(
+                "{}:{} ({} line{}, {} char{})",
+                line,
+                col,
+                sel_lines,
+                if sel_lines == 1 { "" } else { "s" },
+                selected_chars,
+                if selected_chars == 1 { "" } else { "s" },
+            )
+        } else {
+            format!(
+                "{}:{} ({} line{}, {} char{})",
+                line,
+                col,
+                total_lines,
+                if total_lines == 1 { "" } else { "s" },
+                total_chars,
+                if total_chars == 1 { "" } else { "s" },
+            )
+        }
+    }
 
     pub fn has_multiple_cursors(&self) -> bool {
         self.cursors.len() > 1
@@ -1194,7 +1241,7 @@ impl MultiLineEditor {
                 if y < visual_y + line_visual_height {
                     // Mouse is within this logical line's visual area
                     let local_y = y - visual_y;
-                    let local_pos = Point::new(point.x - bounds.left(), local_y);
+                    let local_pos = Point::new(point.x - bounds.left() - self.last_gutter_width, local_y);
                     if let Some(wl) = self.last_wrapped_lines.get(line_idx) {
                         let col = match wl.closest_index_for_position(local_pos, self.last_line_height) {
                             Ok(idx) | Err(idx) => idx,
@@ -1217,7 +1264,7 @@ impl MultiLineEditor {
             };
 
             let col = if let Some(shaped) = self.last_shaped_lines.get(line) {
-                shaped.closest_index_for_x(point.x - bounds.left() + self.scroll_offset.x)
+                shaped.closest_index_for_x(point.x - bounds.left() - self.last_gutter_width + self.scroll_offset.x)
             } else {
                 0
             };
@@ -1250,7 +1297,8 @@ impl MultiLineEditor {
             if self.word_wrap {
                 self.scroll_offset.x = px(0.);
             } else {
-                let max_x = (self.last_max_line_width - bounds.size.width).max(px(0.));
+                let content_width = bounds.size.width - self.last_gutter_width;
+                let max_x = (self.last_max_line_width - content_width).max(px(0.));
                 if self.scroll_offset.x > max_x {
                     self.scroll_offset.x = max_x;
                 }
@@ -1299,17 +1347,18 @@ impl MultiLineEditor {
                 self.scroll_offset.y = cursor_y - bounds.size.height + self.last_line_height;
             }
 
-            // Horizontal scroll to cursor
+            // Horizontal scroll to cursor (content area excludes gutter)
             let cursor_x = self.last_shaped_lines
                 .get(cursor_line)
                 .map(|l| l.x_for_index(cursor_col))
                 .unwrap_or(px(0.));
+            let content_width = bounds.size.width - self.last_gutter_width;
             let visible_left = self.scroll_offset.x;
-            let visible_right = visible_left + bounds.size.width - px(16.); // padding
+            let visible_right = visible_left + content_width - px(16.); // padding
             if cursor_x < visible_left {
                 self.scroll_offset.x = cursor_x;
             } else if cursor_x > visible_right {
-                self.scroll_offset.x = cursor_x - bounds.size.width + px(16.);
+                self.scroll_offset.x = cursor_x - content_width + px(16.);
             }
         }
         self.clamp_scroll();
@@ -1587,9 +1636,10 @@ impl EntityInputHandler for MultiLineEditor {
         let top = bounds.top() + self.last_line_height * start_pos.line - self.scroll_offset.y;
         let bottom = top + self.last_line_height * (end_pos.line - start_pos.line + 1);
 
+        let content_left = bounds.left() + self.last_gutter_width;
         Some(Bounds::from_corners(
-            point(bounds.left() + start_x, top),
-            point(bounds.left() + end_x, bottom),
+            point(content_left + start_x, top),
+            point(content_left + end_x, bottom),
         ))
     }
 
@@ -1699,6 +1749,8 @@ struct MultiLinePrepaintState {
     selections: Vec<PaintQuad>,
     scroll_offset: Point<Pixels>,
     line_height: Pixels,
+    gutter_width: Pixels,
+    gutter_line_numbers: Vec<(ShapedLine, Pixels)>, // (shaped number, y position)
 }
 
 impl IntoElement for MultiLineTextElement {
@@ -1747,14 +1799,33 @@ impl Element for MultiLineTextElement {
         let cursor_opacity = input.cursor_opacity;
         let word_wrap = input.word_wrap;
 
+        // Calculate gutter width based on number of digits in max line number
+        let line_count = input.lines.len();
+        let digit_count = if line_count == 0 { 1 } else { (line_count as f64).log10().floor() as usize + 1 };
+        let sample_text: SharedString = "8".repeat(digit_count).into();
+        let gutter_run = TextRun {
+            len: sample_text.len(),
+            font: style.font(),
+            color: theme.overlay0.into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let sample_shaped = window.text_system().shape_line(sample_text, font_size, &[gutter_run], None);
+        let gutter_padding = px(16.); // padding after line numbers
+        let gutter_width = sample_shaped.width + gutter_padding;
+
+        let content_left = bounds.left() + gutter_width;
+        let content_width = bounds.size.width - gutter_width;
+
         let mut shaped_lines = Vec::new();
         let mut wrapped_lines = Vec::new();
         let mut visual_line_counts = Vec::with_capacity(input.lines.len());
         let mut max_line_width = px(0.);
 
         if word_wrap {
-            // Shape with wrapping
-            let wrap_width = bounds.size.width;
+            // Shape with wrapping — wrap within content area
+            let wrap_width = content_width;
             for line_text in &input.lines {
                 let display_text: SharedString = if line_text.is_empty() {
                     " ".into()
@@ -1813,6 +1884,30 @@ impl Element for MultiLineTextElement {
             }
         }
 
+        // Shape line numbers
+        let gutter_color = theme.overlay0;
+        let mut gutter_line_numbers = Vec::with_capacity(line_count);
+        let mut visual_y = px(0.);
+        for (i, &vcount) in visual_line_counts.iter().enumerate() {
+            let y = visual_y - scroll_offset.y;
+            // Only shape if potentially visible
+            let visual_height = line_height * vcount;
+            if y + visual_height >= px(0.) && y <= bounds.size.height {
+                let num_str: SharedString = format!("{}", i + 1).into();
+                let num_run = TextRun {
+                    len: num_str.len(),
+                    font: style.font(),
+                    color: gutter_color.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped_num = window.text_system().shape_line(num_str, font_size, &[num_run], None);
+                gutter_line_numbers.push((shaped_num, y));
+            }
+            visual_y += visual_height;
+        }
+
         // Build cursor rects and selection rects
         let mut cursor_rects = Vec::new();
         let mut selections = Vec::new();
@@ -1839,7 +1934,7 @@ impl Element for MultiLineTextElement {
                 };
 
                 let cursor_screen = point(
-                    bounds.left() + cx_offset,
+                    content_left + cx_offset,
                     bounds.top() + base_y + cy_offset - scroll_offset.y,
                 );
 
@@ -1865,20 +1960,18 @@ impl Element for MultiLineTextElement {
                                 // Same visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(bounds.left() + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
-                                        point(bounds.left() + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                        point(content_left + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
+                                        point(content_left + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
                             } else {
-                                // Spans multiple visual lines — paint start to end of first line,
-                                // full middle lines, and start of last line to end
-                                let wrap_width = bounds.size.width;
+                                // Spans multiple visual lines
                                 // First visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(bounds.left() + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
-                                        point(bounds.left() + wrap_width, bounds.top() + base + start_pos.y + line_height - scroll_offset.y),
+                                        point(content_left + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
+                                        point(content_left + content_width, bounds.top() + base + start_pos.y + line_height - scroll_offset.y),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
@@ -1889,8 +1982,8 @@ impl Element for MultiLineTextElement {
                                     let vy = line_height * vl;
                                     selections.push(fill(
                                         Bounds::from_corners(
-                                            point(bounds.left(), bounds.top() + base + vy - scroll_offset.y),
-                                            point(bounds.left() + wrap_width, bounds.top() + base + vy + line_height - scroll_offset.y),
+                                            point(content_left, bounds.top() + base + vy - scroll_offset.y),
+                                            point(content_left + content_width, bounds.top() + base + vy + line_height - scroll_offset.y),
                                         ),
                                         rgba(0x3311ff30),
                                     ));
@@ -1898,8 +1991,8 @@ impl Element for MultiLineTextElement {
                                 // Last visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(bounds.left(), bounds.top() + base + end_pos.y - scroll_offset.y),
-                                        point(bounds.left() + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                        point(content_left, bounds.top() + base + end_pos.y - scroll_offset.y),
+                                        point(content_left + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
@@ -1929,7 +2022,7 @@ impl Element for MultiLineTextElement {
                         cursor_rects.push((
                             Bounds::new(
                                 point(
-                                    bounds.left() + x - scroll_offset.x,
+                                    content_left + x - scroll_offset.x,
                                     bounds.top() + y - scroll_offset.y,
                                 ),
                                 size(px(2.), line_height),
@@ -1952,8 +2045,8 @@ impl Element for MultiLineTextElement {
 
                         selections.push(fill(
                             Bounds::from_corners(
-                                point(bounds.left() + x_start - scroll_offset.x, bounds.top() + y - scroll_offset.y),
-                                point(bounds.left() + x_end - scroll_offset.x, bounds.top() + y + line_height - scroll_offset.y),
+                                point(content_left + x_start - scroll_offset.x, bounds.top() + y - scroll_offset.y),
+                                point(content_left + x_end - scroll_offset.x, bounds.top() + y + line_height - scroll_offset.y),
                             ),
                             rgba(0x3311ff30),
                         ));
@@ -1964,7 +2057,7 @@ impl Element for MultiLineTextElement {
                         let y = line_height * c.position.line;
                         cursor_rects.push((
                             Bounds::new(
-                                point(bounds.left() + x - scroll_offset.x, bounds.top() + y - scroll_offset.y),
+                                point(content_left + x - scroll_offset.x, bounds.top() + y - scroll_offset.y),
                                 size(px(2.), line_height),
                             ),
                             theme.accent,
@@ -1985,6 +2078,8 @@ impl Element for MultiLineTextElement {
             selections,
             scroll_offset,
             line_height,
+            gutter_width,
+            gutter_line_numbers,
         }
     }
 
@@ -2012,6 +2107,17 @@ impl Element for MultiLineTextElement {
 
         let line_height = prepaint.line_height;
         let scroll_offset = prepaint.scroll_offset;
+        let gutter_width = prepaint.gutter_width;
+        let content_left = bounds.left() + gutter_width;
+
+        // Paint line numbers in the gutter (right-aligned)
+        for (shaped_num, y) in &prepaint.gutter_line_numbers {
+            let num_x = bounds.left() + gutter_width - px(16.) - shaped_num.width;
+            let origin = point(num_x, bounds.top() + *y);
+            shaped_num
+                .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                .ok();
+        }
 
         if prepaint.word_wrap {
             // Paint wrapped lines
@@ -2021,7 +2127,7 @@ impl Element for MultiLineTextElement {
                 let y = bounds.top() + visual_y - scroll_offset.y;
                 // Skip lines outside visible bounds
                 if y + visual_height >= bounds.top() && y <= bounds.bottom() {
-                    let origin = point(bounds.left(), y);
+                    let origin = point(content_left, y);
                     wrapped
                         .paint(origin, line_height, TextAlign::Left, None, window, cx)
                         .ok();
@@ -2035,7 +2141,7 @@ impl Element for MultiLineTextElement {
                 if y + line_height < bounds.top() || y > bounds.bottom() {
                     continue;
                 }
-                let origin = point(bounds.left() - scroll_offset.x, y);
+                let origin = point(content_left - scroll_offset.x, y);
                 shaped
                     .paint(origin, line_height, TextAlign::Left, None, window, cx)
                     .ok();
@@ -2069,6 +2175,7 @@ impl Element for MultiLineTextElement {
             input.last_max_line_width = max_line_width;
             input.last_bounds = Some(bounds);
             input.last_line_height = line_height;
+            input.last_gutter_width = gutter_width;
             // Apply scroll_to_cursor with fresh layout data when cursor moved
             if input.needs_scroll_to_cursor {
                 input.needs_scroll_to_cursor = false;
