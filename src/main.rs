@@ -146,6 +146,20 @@ fn main() {
     }
 
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        // Load embedded fonts
+        {
+            let font_paths = cx.asset_source().list("fonts").unwrap();
+            let mut fonts = Vec::new();
+            for path in font_paths {
+                if path.ends_with(".ttf")
+                    && let Ok(Some(data)) = cx.asset_source().load(&path)
+                {
+                    fonts.push(data);
+                }
+            }
+            cx.text_system().add_fonts(fonts).unwrap();
+        }
+
         // Bind keybindings
         cx.bind_keys([
             // App-level keybindings

@@ -1660,8 +1660,9 @@ impl Render for MultiLineEditor {
             .bg(theme.surface0)
             .size_full()
             .overflow_hidden()
+            .font_family("JetBrains Mono")
             .line_height(px(24.))
-            .text_size(px(16.))
+            .text_size(px(14.))
             .child(
                 div()
                     .w_full()
