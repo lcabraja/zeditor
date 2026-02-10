@@ -125,6 +125,26 @@ impl Focusable for PopupEditor {
 }
 
 fn main() {
+    // Check for CLI text argument or piped stdin
+    #[cfg(target_os = "macos")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 1 {
+            let text = args[1..].join(" ");
+            hotkey::set_initial_text(text);
+        } else {
+            unsafe extern "C" { fn isatty(fd: i32) -> i32; }
+            let is_tty = unsafe { isatty(0) != 0 };
+            if !is_tty {
+                use std::io::Read;
+                let mut text = String::new();
+                if std::io::stdin().read_to_string(&mut text).is_ok() && !text.is_empty() {
+                    hotkey::set_initial_text(text);
+                }
+            }
+        }
+    }
+
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         // Bind keybindings
         cx.bind_keys([
@@ -170,6 +190,7 @@ fn main() {
             KeyBinding::new("cmd-v", Paste, Some("MultiLineEditor")),
             KeyBinding::new("cmd-c", Copy, Some("MultiLineEditor")),
             KeyBinding::new("cmd-x", Cut, Some("MultiLineEditor")),
+            KeyBinding::new("alt-z", ToggleWordWrap, Some("MultiLineEditor")),
             // Preferences window keybindings
             KeyBinding::new("escape", ClosePreferences, Some("PreferencesWindow")),
             KeyBinding::new("cmd-w", ClosePreferences, Some("PreferencesWindow")),

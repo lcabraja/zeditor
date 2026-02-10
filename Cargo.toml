@@ -9,7 +9,7 @@ unexpected_cfgs = { level = "allow", check-cfg = ["cfg(feature, values(\"cargo-c
 
 [[bin]]
 path = "src/main.rs"
-name = "popup-editor"
+name = "zeditor"
 
 [dependencies]
 anyhow = "1"

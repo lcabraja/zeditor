@@ -57,6 +57,7 @@ actions!(
         SelectEnd,
         SelectDocumentStart,
         SelectDocumentEnd,
+        ToggleWordWrap,
     ]
 );
 
@@ -124,10 +125,17 @@ pub struct MultiLineEditor {
     pub preferred_col_x: Option<Pixels>,
     pub marked_range: Option<Range<usize>>,
     pub is_selecting: bool,
+    pub word_wrap: bool,
     // Layout cache for IME/mouse
     pub last_shaped_lines: Vec<ShapedLine>,
+    pub last_wrapped_lines: Vec<WrappedLine>,
     pub last_bounds: Option<Bounds<Pixels>>,
     pub last_line_height: Pixels,
+    pub last_max_line_width: Pixels,
+    /// Number of visual lines per logical line (1 when not wrapped)
+    pub last_visual_line_counts: Vec<usize>,
+    /// Set when cursor moves; cleared after paint applies scroll_to_cursor
+    pub needs_scroll_to_cursor: bool,
     // Cursor blink state
     pub cursor_opacity: f32,
     pub cursor_fading_in: bool,
@@ -146,9 +154,14 @@ impl MultiLineEditor {
             preferred_col_x: None,
             marked_range: None,
             is_selecting: false,
+            word_wrap: false,
             last_shaped_lines: Vec::new(),
+            last_wrapped_lines: Vec::new(),
             last_bounds: None,
             last_line_height: px(24.),
+            last_max_line_width: px(0.),
+            last_visual_line_counts: Vec::new(),
+            needs_scroll_to_cursor: false,
             cursor_opacity: 1.0,
             cursor_fading_in: true,
             blink_epoch: 0,
@@ -242,6 +255,7 @@ impl MultiLineEditor {
         let pos = self.clamp_position(&pos);
         self.cursors = vec![Cursor::new(pos.line, pos.col)];
         self.preferred_col_x = None;
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -253,6 +267,7 @@ impl MultiLineEditor {
             c.anchor = Some(c.position.clone());
         }
         c.position = pos;
+        self.needs_scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -265,6 +280,7 @@ impl MultiLineEditor {
             c.anchor = None;
         }
         self.merge_overlapping_cursors();
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -280,6 +296,7 @@ impl MultiLineEditor {
             c.position = f(&c.position, &self.lines);
         }
         self.merge_overlapping_cursors();
+        self.needs_scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -419,6 +436,7 @@ impl MultiLineEditor {
             }
             self.merge_overlapping_cursors();
             self.preferred_col_x = None;
+            self.needs_scroll_to_cursor = true;
             self.reset_cursor_blink(cx);
             cx.notify();
         } else {
@@ -437,6 +455,7 @@ impl MultiLineEditor {
             }
             self.merge_overlapping_cursors();
             self.preferred_col_x = None;
+            self.needs_scroll_to_cursor = true;
             self.reset_cursor_blink(cx);
             cx.notify();
         } else {
@@ -534,6 +553,7 @@ impl MultiLineEditor {
             c.position = pos.clone();
         }
         self.merge_overlapping_cursors();
+        self.needs_scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -549,6 +569,7 @@ impl MultiLineEditor {
             c.position = pos.clone();
         }
         self.merge_overlapping_cursors();
+        self.needs_scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -698,6 +719,7 @@ impl MultiLineEditor {
                 a.line -= 1;
             }
         }
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -724,6 +746,7 @@ impl MultiLineEditor {
                 a.line += 1;
             }
         }
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -839,14 +862,41 @@ impl MultiLineEditor {
         result
     }
 
+    // --- Layout helpers (abstract over wrapped/unwrapped) ---
+
+    fn x_for_index_in_line(&self, line: usize, col: usize) -> Pixels {
+        if self.word_wrap {
+            self.last_wrapped_lines.get(line)
+                .map(|wl| wl.unwrapped_layout.x_for_index(col))
+                .unwrap_or(px(0.))
+        } else {
+            self.last_shaped_lines.get(line)
+                .map(|l| l.x_for_index(col))
+                .unwrap_or(px(0.))
+        }
+    }
+
+    fn closest_index_for_x_in_line(&self, line: usize, x: Pixels) -> usize {
+        if self.word_wrap {
+            self.last_wrapped_lines.get(line)
+                .map(|wl| wl.unwrapped_layout.closest_index_for_x(x))
+                .unwrap_or(0)
+        } else {
+            self.last_shaped_lines.get(line)
+                .map(|l| l.closest_index_for_x(x))
+                .unwrap_or(0)
+        }
+    }
+
     // --- Vertical movement ---
 
     fn move_vertically(&mut self, direction: i32, selecting: bool, cx: &mut Context<Self>) {
         // Ensure preferred_col_x is set from current position
-        if self.preferred_col_x.is_none()
-            && let Some(shaped) = self.last_shaped_lines.get(self.cursors[0].position.line)
-        {
-            self.preferred_col_x = Some(shaped.x_for_index(self.cursors[0].position.col));
+        if self.preferred_col_x.is_none() {
+            self.preferred_col_x = Some(self.x_for_index_in_line(
+                self.cursors[0].position.line,
+                self.cursors[0].position.col,
+            ));
         }
 
         for c in &mut self.cursors {
@@ -883,10 +933,14 @@ impl MultiLineEditor {
 
             // Find col from preferred_col_x
             let col = if let Some(px_x) = self.preferred_col_x {
-                if let Some(shaped) = self.last_shaped_lines.get(new_line) {
-                    shaped.closest_index_for_x(px_x)
+                if self.word_wrap {
+                    self.last_wrapped_lines.get(new_line)
+                        .map(|wl| wl.unwrapped_layout.closest_index_for_x(px_x))
+                        .unwrap_or(0)
                 } else {
-                    c.position.col.min(self.lines[new_line].len())
+                    self.last_shaped_lines.get(new_line)
+                        .map(|l| l.closest_index_for_x(px_x))
+                        .unwrap_or(c.position.col.min(self.lines[new_line].len()))
                 }
             } else {
                 c.position.col.min(self.lines[new_line].len())
@@ -903,15 +957,14 @@ impl MultiLineEditor {
         }
 
         self.merge_overlapping_cursors();
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
 
     fn col_for_preferred_x(&self, line: usize, _cx: &mut Context<Self>) -> usize {
-        if let Some(px_x) = self.preferred_col_x
-            && let Some(shaped) = self.last_shaped_lines.get(line)
-        {
-            return shaped.closest_index_for_x(px_x);
+        if let Some(px_x) = self.preferred_col_x {
+            return self.closest_index_for_x_in_line(line, px_x);
         }
         // Fallback: use primary cursor col clamped to line length
         self.cursors[0].position.col.min(self.lines[line].len())
@@ -977,6 +1030,7 @@ impl MultiLineEditor {
         self.merge_overlapping_cursors();
         self.marked_range = None;
         self.preferred_col_x = None;
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1100,17 +1154,26 @@ impl MultiLineEditor {
         }
     }
 
+    fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
+        self.word_wrap = !self.word_wrap;
+        self.scroll_offset.x = px(0.);
+        cx.notify();
+    }
+
     fn on_scroll(
         &mut self,
         event: &ScrollWheelEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta_y = match event.delta {
-            ScrollDelta::Pixels(d) => -d.y,
-            ScrollDelta::Lines(d) => -d.y * self.last_line_height,
+        let (delta_x, delta_y) = match event.delta {
+            ScrollDelta::Pixels(d) => (-d.x, -d.y),
+            ScrollDelta::Lines(d) => (-d.x * self.last_line_height, -d.y * self.last_line_height),
         };
         self.scroll_offset.y += delta_y;
+        if !self.word_wrap {
+            self.scroll_offset.x += delta_x;
+        }
         self.clamp_scroll();
         cx.notify();
     }
@@ -1122,49 +1185,132 @@ impl MultiLineEditor {
         };
 
         let y = point.y - bounds.top() + self.scroll_offset.y;
-        let line = if y < px(0.) {
-            0
-        } else {
-            let l = (y / self.last_line_height) as usize;
-            l.min(self.lines.len().saturating_sub(1))
-        };
 
-        let col = if let Some(shaped) = self.last_shaped_lines.get(line) {
-            shaped.closest_index_for_x(point.x - bounds.left() + self.scroll_offset.x)
+        if self.word_wrap {
+            // Find which logical line this visual Y falls into
+            let mut visual_y = px(0.);
+            for (line_idx, &count) in self.last_visual_line_counts.iter().enumerate() {
+                let line_visual_height = self.last_line_height * count;
+                if y < visual_y + line_visual_height {
+                    // Mouse is within this logical line's visual area
+                    let local_y = y - visual_y;
+                    let local_pos = Point::new(point.x - bounds.left(), local_y);
+                    if let Some(wl) = self.last_wrapped_lines.get(line_idx) {
+                        let col = match wl.closest_index_for_position(local_pos, self.last_line_height) {
+                            Ok(idx) | Err(idx) => idx,
+                        };
+                        return CursorPosition::new(line_idx, col);
+                    }
+                    return CursorPosition::new(line_idx, 0);
+                }
+                visual_y += line_visual_height;
+            }
+            // Past the end
+            let last = self.lines.len().saturating_sub(1);
+            CursorPosition::new(last, self.lines[last].len())
         } else {
-            0
-        };
+            let line = if y < px(0.) {
+                0
+            } else {
+                let l = (y / self.last_line_height) as usize;
+                l.min(self.lines.len().saturating_sub(1))
+            };
 
-        CursorPosition::new(line, col)
+            let col = if let Some(shaped) = self.last_shaped_lines.get(line) {
+                shaped.closest_index_for_x(point.x - bounds.left() + self.scroll_offset.x)
+            } else {
+                0
+            };
+
+            CursorPosition::new(line, col)
+        }
     }
 
     fn clamp_scroll(&mut self) {
         if self.scroll_offset.y < px(0.) {
             self.scroll_offset.y = px(0.);
         }
-        // Clamp to max when we know bounds
+        if self.scroll_offset.x < px(0.) {
+            self.scroll_offset.x = px(0.);
+        }
         if let Some(bounds) = &self.last_bounds {
-            let total = self.last_line_height * self.lines.len();
-            let max = (total - bounds.size.height).max(px(0.));
-            if self.scroll_offset.y > max {
-                self.scroll_offset.y = max;
+            // Vertical: total visual lines * line_height
+            let total_visual_lines: usize = if self.word_wrap {
+                self.last_visual_line_counts.iter().sum()
+            } else {
+                self.lines.len()
+            };
+            let total_y = self.last_line_height * total_visual_lines;
+            let max_y = (total_y - bounds.size.height).max(px(0.));
+            if self.scroll_offset.y > max_y {
+                self.scroll_offset.y = max_y;
+            }
+
+            // Horizontal: only when not wrapping
+            if self.word_wrap {
+                self.scroll_offset.x = px(0.);
+            } else {
+                let max_x = (self.last_max_line_width - bounds.size.width).max(px(0.));
+                if self.scroll_offset.x > max_x {
+                    self.scroll_offset.x = max_x;
+                }
             }
         }
     }
 
     fn scroll_to_cursor(&mut self) {
         let bounds = match &self.last_bounds {
-            Some(b) => b,
+            Some(b) => *b,
             None => return,
         };
-        let cursor_y = self.last_line_height * self.cursors[0].position.line;
-        let visible_top = self.scroll_offset.y;
-        let visible_bottom = visible_top + bounds.size.height - self.last_line_height;
+        let cursor_line = self.cursors[0].position.line;
+        let cursor_col = self.cursors[0].position.col;
 
-        if cursor_y < visible_top {
-            self.scroll_offset.y = cursor_y;
-        } else if cursor_y > visible_bottom {
-            self.scroll_offset.y = cursor_y - bounds.size.height + self.last_line_height;
+        if self.word_wrap {
+            // Compute visual Y by summing visual line counts for lines before cursor,
+            // then add the wrapped sub-line offset for the cursor's line
+            let visual_y_lines: usize = self.last_visual_line_counts.iter().take(cursor_line).sum();
+            // Find which visual sub-line within this wrapped line the cursor is on
+            let sub_line = if let Some(wrapped) = self.last_wrapped_lines.get(cursor_line) {
+                if let Some(pos) = wrapped.position_for_index(cursor_col, self.last_line_height) {
+                    (pos.y / self.last_line_height) as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let cursor_y = self.last_line_height * (visual_y_lines + sub_line);
+            let visible_top = self.scroll_offset.y;
+            let visible_bottom = visible_top + bounds.size.height - self.last_line_height;
+            if cursor_y < visible_top {
+                self.scroll_offset.y = cursor_y;
+            } else if cursor_y > visible_bottom {
+                self.scroll_offset.y = cursor_y - bounds.size.height + self.last_line_height;
+            }
+        } else {
+            // Non-wrapped: simple line-based Y
+            let cursor_y = self.last_line_height * cursor_line;
+            let visible_top = self.scroll_offset.y;
+            let visible_bottom = visible_top + bounds.size.height - self.last_line_height;
+            if cursor_y < visible_top {
+                self.scroll_offset.y = cursor_y;
+            } else if cursor_y > visible_bottom {
+                self.scroll_offset.y = cursor_y - bounds.size.height + self.last_line_height;
+            }
+
+            // Horizontal scroll to cursor
+            let cursor_x = self.last_shaped_lines
+                .get(cursor_line)
+                .map(|l| l.x_for_index(cursor_col))
+                .unwrap_or(px(0.));
+            let visible_left = self.scroll_offset.x;
+            let visible_right = visible_left + bounds.size.width - px(16.); // padding
+            if cursor_x < visible_left {
+                self.scroll_offset.x = cursor_x;
+            } else if cursor_x > visible_right {
+                self.scroll_offset.x = cursor_x - bounds.size.width + px(16.);
+            }
         }
         self.clamp_scroll();
     }
@@ -1364,6 +1510,7 @@ impl EntityInputHandler for MultiLineEditor {
         self.cursors = vec![Cursor::new(new_pos.line, new_pos.col)];
         self.marked_range = None;
         self.preferred_col_x = None;
+        self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1410,6 +1557,7 @@ impl EntityInputHandler for MultiLineEditor {
             self.cursors = vec![Cursor::new(new_end.line, new_end.col)];
         }
 
+        self.needs_scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -1503,6 +1651,7 @@ impl Render for MultiLineEditor {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::toggle_word_wrap))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1540,6 +1689,10 @@ struct MultiLineTextElement {
 
 struct MultiLinePrepaintState {
     shaped_lines: Vec<ShapedLine>,
+    wrapped_lines: Vec<WrappedLine>,
+    word_wrap: bool,
+    visual_line_counts: Vec<usize>,
+    max_line_width: Pixels,
     cursors: Vec<(Bounds<Pixels>, Rgba)>,
     cursor_opacity: f32,
     selections: Vec<PaintQuad>,
@@ -1569,12 +1722,9 @@ impl Element for MultiLineTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let input = self.input.read(cx);
-        let line_count = input.lines.len().max(1);
-        let line_height = window.line_height();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (line_height * line_count).into();
+        style.size.height = relative(1.).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1594,118 +1744,241 @@ impl Element for MultiLineTextElement {
         let line_height = window.line_height();
         let scroll_offset = input.scroll_offset;
         let cursor_opacity = input.cursor_opacity;
+        let word_wrap = input.word_wrap;
 
-        // Shape all lines
-        let mut shaped_lines = Vec::with_capacity(input.lines.len());
-        for line_text in &input.lines {
-            let display_text: SharedString = if line_text.is_empty() {
-                " ".into() // shape at least a space for correct height
-            } else {
-                line_text.clone().into()
-            };
-            let run = TextRun {
-                len: display_text.len(),
-                font: style.font(),
-                color: style.color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let shaped = window
-                .text_system()
-                .shape_line(display_text, font_size, &[run], None);
-            shaped_lines.push(shaped);
-        }
+        let mut shaped_lines = Vec::new();
+        let mut wrapped_lines = Vec::new();
+        let mut visual_line_counts = Vec::with_capacity(input.lines.len());
+        let mut max_line_width = px(0.);
 
-        // Build cursor rects
-        let mut cursor_rects = Vec::new();
-        let is_focused = input.focus_handle.is_focused(window);
-        if is_focused {
-            for c in &input.cursors {
-                if !c.has_selection() {
-                    let x = shaped_lines
-                        .get(c.position.line)
-                        .map(|l| l.x_for_index(c.position.col))
-                        .unwrap_or(px(0.));
-                    let y = line_height * c.position.line;
-                    cursor_rects.push((
-                        Bounds::new(
-                            point(
-                                bounds.left() + x - scroll_offset.x,
-                                bounds.top() + y - scroll_offset.y,
-                            ),
-                            size(px(2.), line_height),
-                        ),
-                        theme.accent,
-                    ));
+        if word_wrap {
+            // Shape with wrapping
+            let wrap_width = bounds.size.width;
+            for line_text in &input.lines {
+                let display_text: SharedString = if line_text.is_empty() {
+                    " ".into()
+                } else {
+                    line_text.clone().into()
+                };
+                let run = TextRun {
+                    len: display_text.len(),
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let result = window
+                    .text_system()
+                    .shape_text(display_text, font_size, &[run], Some(wrap_width), None);
+                if let Ok(mut lines) = result {
+                    if let Some(wl) = lines.pop() {
+                        let count = wl.wrap_boundaries.len() + 1;
+                        visual_line_counts.push(count);
+                        wrapped_lines.push(wl);
+                    } else {
+                        visual_line_counts.push(1);
+                        wrapped_lines.push(WrappedLine::default());
+                    }
+                } else {
+                    visual_line_counts.push(1);
+                    wrapped_lines.push(WrappedLine::default());
                 }
+            }
+        } else {
+            // Shape without wrapping
+            for line_text in &input.lines {
+                let display_text: SharedString = if line_text.is_empty() {
+                    " ".into()
+                } else {
+                    line_text.clone().into()
+                };
+                let run = TextRun {
+                    len: display_text.len(),
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_line(display_text, font_size, &[run], None);
+                if shaped.width > max_line_width {
+                    max_line_width = shaped.width;
+                }
+                shaped_lines.push(shaped);
+                visual_line_counts.push(1);
             }
         }
 
-        // Build selection rects
+        // Build cursor rects and selection rects
+        let mut cursor_rects = Vec::new();
         let mut selections = Vec::new();
-        for c in &input.cursors {
-            if let Some((start, end)) = c.selection_range() {
-                for line_idx in start.line..=end.line {
-                    let col_start = if line_idx == start.line {
-                        start.col
-                    } else {
-                        0
-                    };
-                    let col_end = if line_idx == end.line {
-                        end.col
-                    } else {
-                        input.lines[line_idx].len()
-                    };
+        let is_focused = input.focus_handle.is_focused(window);
 
-                    let x_start = shaped_lines
-                        .get(line_idx)
-                        .map(|l| l.x_for_index(col_start))
-                        .unwrap_or(px(0.));
-                    let x_end = shaped_lines
-                        .get(line_idx)
-                        .map(|l| l.x_for_index(col_end))
-                        .unwrap_or(px(0.));
-                    let y = line_height * line_idx;
+        // Helper: compute the visual Y offset for a logical line
+        let visual_y_for_line = |line: usize| -> Pixels {
+            let visual_lines_before: usize = visual_line_counts.iter().take(line).sum();
+            line_height * visual_lines_before
+        };
 
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(
-                                bounds.left() + x_start - scroll_offset.x,
-                                bounds.top() + y - scroll_offset.y,
-                            ),
-                            point(
-                                bounds.left() + x_end - scroll_offset.x,
-                                bounds.top() + y + line_height - scroll_offset.y,
-                            ),
-                        ),
-                        rgba(0x3311ff30),
+        if word_wrap {
+            // Wrapped mode: use WrappedLineLayout position_for_index
+            for c in &input.cursors {
+                let base_y = visual_y_for_line(c.position.line);
+                let (cx_offset, cy_offset) = if let Some(wl) = wrapped_lines.get(c.position.line) {
+                    if let Some(pos) = wl.position_for_index(c.position.col, line_height) {
+                        (pos.x, pos.y)
+                    } else {
+                        (px(0.), px(0.))
+                    }
+                } else {
+                    (px(0.), px(0.))
+                };
+
+                let cursor_screen = point(
+                    bounds.left() + cx_offset,
+                    bounds.top() + base_y + cy_offset - scroll_offset.y,
+                );
+
+                if !c.has_selection() && is_focused {
+                    cursor_rects.push((
+                        Bounds::new(cursor_screen, size(px(2.), line_height)),
+                        theme.accent,
                     ));
                 }
 
-                // Also show cursor at end of selection
-                if is_focused {
-                    let x = shaped_lines
-                        .get(c.position.line)
-                        .map(|l| l.x_for_index(c.position.col))
-                        .unwrap_or(px(0.));
-                    let y = line_height * c.position.line;
-                    cursor_rects.push((
-                        Bounds::new(
-                            point(
-                                bounds.left() + x - scroll_offset.x,
-                                bounds.top() + y - scroll_offset.y,
+                if let Some((start, end)) = c.selection_range() {
+                    // For wrapped selections, paint per-visual-line segments
+                    for line_idx in start.line..=end.line {
+                        let col_start = if line_idx == start.line { start.col } else { 0 };
+                        let col_end = if line_idx == end.line { end.col } else { input.lines[line_idx].len() };
+                        let base = visual_y_for_line(line_idx);
+
+                        if let Some(wl) = wrapped_lines.get(line_idx) {
+                            let start_pos = wl.position_for_index(col_start, line_height).unwrap_or(point(px(0.), px(0.)));
+                            let end_pos = wl.position_for_index(col_end, line_height).unwrap_or(point(px(0.), px(0.)));
+
+                            if start_pos.y == end_pos.y {
+                                // Same visual line
+                                selections.push(fill(
+                                    Bounds::from_corners(
+                                        point(bounds.left() + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
+                                        point(bounds.left() + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                    ),
+                                    rgba(0x3311ff30),
+                                ));
+                            } else {
+                                // Spans multiple visual lines — paint start to end of first line,
+                                // full middle lines, and start of last line to end
+                                let wrap_width = bounds.size.width;
+                                // First visual line
+                                selections.push(fill(
+                                    Bounds::from_corners(
+                                        point(bounds.left() + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
+                                        point(bounds.left() + wrap_width, bounds.top() + base + start_pos.y + line_height - scroll_offset.y),
+                                    ),
+                                    rgba(0x3311ff30),
+                                ));
+                                // Middle visual lines
+                                let start_vline = (start_pos.y / line_height) as usize;
+                                let end_vline = (end_pos.y / line_height) as usize;
+                                for vl in (start_vline + 1)..end_vline {
+                                    let vy = line_height * vl;
+                                    selections.push(fill(
+                                        Bounds::from_corners(
+                                            point(bounds.left(), bounds.top() + base + vy - scroll_offset.y),
+                                            point(bounds.left() + wrap_width, bounds.top() + base + vy + line_height - scroll_offset.y),
+                                        ),
+                                        rgba(0x3311ff30),
+                                    ));
+                                }
+                                // Last visual line
+                                selections.push(fill(
+                                    Bounds::from_corners(
+                                        point(bounds.left(), bounds.top() + base + end_pos.y - scroll_offset.y),
+                                        point(bounds.left() + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                    ),
+                                    rgba(0x3311ff30),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Cursor at selection edge
+                    if is_focused {
+                        cursor_rects.push((
+                            Bounds::new(cursor_screen, size(px(2.), line_height)),
+                            theme.accent,
+                        ));
+                    }
+                }
+            }
+        } else {
+            // Non-wrapped mode: use ShapedLine x_for_index
+            if is_focused {
+                for c in &input.cursors {
+                    if !c.has_selection() {
+                        let x = shaped_lines
+                            .get(c.position.line)
+                            .map(|l| l.x_for_index(c.position.col))
+                            .unwrap_or(px(0.));
+                        let y = line_height * c.position.line;
+                        cursor_rects.push((
+                            Bounds::new(
+                                point(
+                                    bounds.left() + x - scroll_offset.x,
+                                    bounds.top() + y - scroll_offset.y,
+                                ),
+                                size(px(2.), line_height),
                             ),
-                            size(px(2.), line_height),
-                        ),
-                        theme.accent,
-                    ));
+                            theme.accent,
+                        ));
+                    }
+                }
+            }
+
+            for c in &input.cursors {
+                if let Some((start, end)) = c.selection_range() {
+                    for line_idx in start.line..=end.line {
+                        let col_start = if line_idx == start.line { start.col } else { 0 };
+                        let col_end = if line_idx == end.line { end.col } else { input.lines[line_idx].len() };
+
+                        let x_start = shaped_lines.get(line_idx).map(|l| l.x_for_index(col_start)).unwrap_or(px(0.));
+                        let x_end = shaped_lines.get(line_idx).map(|l| l.x_for_index(col_end)).unwrap_or(px(0.));
+                        let y = line_height * line_idx;
+
+                        selections.push(fill(
+                            Bounds::from_corners(
+                                point(bounds.left() + x_start - scroll_offset.x, bounds.top() + y - scroll_offset.y),
+                                point(bounds.left() + x_end - scroll_offset.x, bounds.top() + y + line_height - scroll_offset.y),
+                            ),
+                            rgba(0x3311ff30),
+                        ));
+                    }
+
+                    if is_focused {
+                        let x = shaped_lines.get(c.position.line).map(|l| l.x_for_index(c.position.col)).unwrap_or(px(0.));
+                        let y = line_height * c.position.line;
+                        cursor_rects.push((
+                            Bounds::new(
+                                point(bounds.left() + x - scroll_offset.x, bounds.top() + y - scroll_offset.y),
+                                size(px(2.), line_height),
+                            ),
+                            theme.accent,
+                        ));
+                    }
                 }
             }
         }
 
         MultiLinePrepaintState {
             shaped_lines,
+            wrapped_lines,
+            word_wrap,
+            visual_line_counts,
+            max_line_width,
             cursors: cursor_rects,
             cursor_opacity,
             selections,
@@ -1736,20 +2009,36 @@ impl Element for MultiLineTextElement {
             window.paint_quad(sel);
         }
 
-        // Paint lines
         let line_height = prepaint.line_height;
         let scroll_offset = prepaint.scroll_offset;
 
-        for (i, shaped) in prepaint.shaped_lines.iter().enumerate() {
-            let y = bounds.top() + line_height * i - scroll_offset.y;
-            // Skip lines outside visible bounds
-            if y + line_height < bounds.top() || y > bounds.bottom() {
-                continue;
+        if prepaint.word_wrap {
+            // Paint wrapped lines
+            let mut visual_y = px(0.);
+            for (i, wrapped) in prepaint.wrapped_lines.iter().enumerate() {
+                let visual_height = line_height * prepaint.visual_line_counts[i];
+                let y = bounds.top() + visual_y - scroll_offset.y;
+                // Skip lines outside visible bounds
+                if y + visual_height >= bounds.top() && y <= bounds.bottom() {
+                    let origin = point(bounds.left(), y);
+                    wrapped
+                        .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                        .ok();
+                }
+                visual_y += visual_height;
             }
-            let origin = point(bounds.left() - scroll_offset.x, y);
-            shaped
-                .paint(origin, line_height, TextAlign::Left, None, window, cx)
-                .ok();
+        } else {
+            // Paint unwrapped lines
+            for (i, shaped) in prepaint.shaped_lines.iter().enumerate() {
+                let y = bounds.top() + line_height * i - scroll_offset.y;
+                if y + line_height < bounds.top() || y > bounds.bottom() {
+                    continue;
+                }
+                let origin = point(bounds.left() - scroll_offset.x, y);
+                shaped
+                    .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                    .ok();
+            }
         }
 
         // Paint cursors
@@ -1769,11 +2058,25 @@ impl Element for MultiLineTextElement {
 
         // Update cached layout info
         let shaped_lines: Vec<ShapedLine> = prepaint.shaped_lines.drain(..).collect();
-        self.input.update(cx, |input, _cx| {
+        let wrapped_lines: Vec<WrappedLine> = prepaint.wrapped_lines.drain(..).collect();
+        let visual_line_counts = prepaint.visual_line_counts.clone();
+        let max_line_width = prepaint.max_line_width;
+        self.input.update(cx, |input, cx| {
             input.last_shaped_lines = shaped_lines;
+            input.last_wrapped_lines = wrapped_lines;
+            input.last_visual_line_counts = visual_line_counts;
+            input.last_max_line_width = max_line_width;
             input.last_bounds = Some(bounds);
             input.last_line_height = line_height;
-            input.scroll_to_cursor();
+            // Apply scroll_to_cursor with fresh layout data when cursor moved
+            if input.needs_scroll_to_cursor {
+                input.needs_scroll_to_cursor = false;
+                let old_scroll = input.scroll_offset;
+                input.scroll_to_cursor();
+                if input.scroll_offset != old_scroll {
+                    cx.notify();
+                }
+            }
         });
     }
 

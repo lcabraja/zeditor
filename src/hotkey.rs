@@ -135,6 +135,15 @@ pub fn is_show_requested() -> bool {
     SHOW_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
+/// Set initial text and request the window to show.
+/// Used for CLI argument text.
+pub fn set_initial_text(text: String) {
+    if let Ok(mut pending) = PENDING_CLIPBOARD.lock() {
+        *pending = Some(text);
+    }
+    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 /// Actually show the window. Called from the GPUI side after the editor text has been set.
 ///
 /// # Safety

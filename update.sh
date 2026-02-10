@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="Zeditor"
 BUNDLE_DIR="target/${APP_NAME}.app"
-BINARY_NAME="popup-editor"
+BINARY_NAME="zeditor"
 INSTALL_DIR="$HOME/Applications"
 
 echo "Building release..."
