@@ -1,13 +1,16 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
-use crate::preferences::{save_preferences, HotkeyConfig, Preferences};
+use crate::preferences::{HotkeyConfig, Preferences, save_preferences};
 use crate::theme::Theme;
 
 #[cfg(target_os = "macos")]
 use crate::hotkey;
 
-actions!(preferences_window, [ClosePreferences, SavePreferences, ToggleRecording]);
+actions!(
+    preferences_window,
+    [ClosePreferences, SavePreferences, ToggleRecording]
+);
 
 pub struct PreferencesWindow {
     focus_handle: FocusHandle,
@@ -35,7 +38,12 @@ impl PreferencesWindow {
         window.remove_window();
     }
 
-    fn toggle_recording(&mut self, _: &ToggleRecording, _window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_recording(
+        &mut self,
+        _: &ToggleRecording,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.recording {
             self.recording = false;
             self.recorded_key_code = None;
@@ -88,9 +96,7 @@ impl PreferencesWindow {
 
         let keystroke = &event.keystroke;
 
-        if !keystroke.modifiers.platform
-            && !keystroke.modifiers.alt
-            && !keystroke.modifiers.control
+        if !keystroke.modifiers.platform && !keystroke.modifiers.alt && !keystroke.modifiers.control
         {
             return;
         }

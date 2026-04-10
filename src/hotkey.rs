@@ -5,9 +5,9 @@ use cocoa::base::{id, nil};
 use cocoa::foundation::NSString;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 // Carbon Event constants
 const K_VK_ESCAPE: u16 = 0x35; // Virtual key code for Escape
@@ -21,7 +21,8 @@ const NS_KEY_DOWN_MASK: u64 = 1 << 10; // NSEventMaskKeyDown
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
 
 // Notification name for app deactivation
-const NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION: &str = "NSApplicationDidResignActiveNotification";
+const NS_APPLICATION_DID_RESIGN_ACTIVE_NOTIFICATION: &str =
+    "NSApplicationDidResignActiveNotification";
 
 // NSStatusBar thickness (for menu bar)
 const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
@@ -46,11 +47,8 @@ type EventTargetRef = *mut c_void;
 type EventRef = *mut c_void;
 type OSStatus = i32;
 
-type EventHandlerProcPtr = extern "C" fn(
-    handler: EventHandlerRef,
-    event: EventRef,
-    user_data: *mut c_void,
-) -> OSStatus;
+type EventHandlerProcPtr =
+    extern "C" fn(handler: EventHandlerRef, event: EventRef, user_data: *mut c_void) -> OSStatus;
 
 // Carbon Event Manager FFI
 #[link(name = "Carbon", kind = "framework")]
@@ -99,16 +97,57 @@ static GLOBAL_PREVIOUS_APP: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_MENU: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
-static OPEN_PREFS_REQUESTED: AtomicBool = AtomicBool::new(false);
-static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_ERROR: Mutex<Option<String>> = Mutex::new(None);
-static PENDING_CLIPBOARD: Mutex<Option<String>> = Mutex::new(None);
+static PENDING_CLIPBOARD: Mutex<Option<Option<String>>> = Mutex::new(None);
 
-/// Check if the preferences window was requested from the menu.
-/// Atomically swaps the flag and returns the old value.
-pub fn is_prefs_requested() -> bool {
-    OPEN_PREFS_REQUESTED.swap(false, Ordering::SeqCst)
+#[derive(Clone, Copy, Default)]
+pub struct PendingRequests {
+    pub show_window: bool,
+    pub open_preferences: bool,
+}
+
+#[derive(Default)]
+struct RequestState {
+    show_window: bool,
+    open_preferences: bool,
+}
+
+fn request_state() -> &'static (Mutex<RequestState>, Condvar) {
+    static REQUEST_STATE: OnceLock<(Mutex<RequestState>, Condvar)> = OnceLock::new();
+    REQUEST_STATE.get_or_init(|| (Mutex::new(RequestState::default()), Condvar::new()))
+}
+
+fn signal_request(update: impl FnOnce(&mut RequestState)) {
+    let (lock, condvar) = request_state();
+    if let Ok(mut state) = lock.lock() {
+        update(&mut state);
+        condvar.notify_all();
+    }
+}
+
+fn request_show_window() {
+    signal_request(|state| state.show_window = true);
+}
+
+fn request_open_preferences() {
+    signal_request(|state| state.open_preferences = true);
+}
+
+/// Wait until at least one UI request is pending, then drain the current batch.
+pub fn wait_for_requests() -> PendingRequests {
+    let (lock, condvar) = request_state();
+    let mut state = lock.lock().expect("request state lock poisoned");
+    while !state.show_window && !state.open_preferences {
+        state = condvar
+            .wait(state)
+            .expect("request state lock poisoned while waiting");
+    }
+
+    PendingRequests {
+        show_window: std::mem::take(&mut state.show_window),
+        open_preferences: std::mem::take(&mut state.open_preferences),
+    }
 }
 
 /// Get the current error message, if any.
@@ -123,25 +162,44 @@ fn set_error(err: Option<String>) {
     unsafe { update_menu_error() };
 }
 
-/// Take the pre-fetched clipboard text (if any). Returns None if no text was pre-fetched.
-/// This is used by the editor to avoid the slow GPUI clipboard read.
-pub fn take_pending_clipboard() -> Option<String> {
+/// Take the pre-fetched clipboard text state, if one was provided.
+/// `None` means no prefetch happened.
+/// `Some(None)` means the clipboard was checked and no string payload was available.
+pub fn take_pending_clipboard() -> Option<Option<String>> {
     PENDING_CLIPBOARD.lock().ok().and_then(|mut g| g.take())
 }
 
-/// Check if a show-window was requested (hotkey pressed while hidden).
-/// Atomically swaps the flag and returns the old value.
-pub fn is_show_requested() -> bool {
-    SHOW_REQUESTED.swap(false, Ordering::SeqCst)
+fn set_pending_clipboard(text: Option<String>) {
+    if let Ok(mut pending) = PENDING_CLIPBOARD.lock() {
+        *pending = Some(text);
+    }
 }
 
 /// Set initial text and request the window to show.
 /// Used for CLI argument text.
 pub fn set_initial_text(text: String) {
-    if let Ok(mut pending) = PENDING_CLIPBOARD.lock() {
-        *pending = Some(text);
+    set_pending_clipboard(Some(text));
+    request_show_window();
+}
+
+unsafe fn read_clipboard_text() -> Option<String> {
+    let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pasteboard.is_null() {
+        return None;
     }
-    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+
+    let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
+    let ns_string: id = msg_send![pasteboard, stringForType: string_type];
+    if ns_string.is_null() {
+        return None;
+    }
+
+    let utf8: *const std::ffi::c_char = msg_send![ns_string, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+
+    Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
 }
 
 /// Actually show the window. Called from the GPUI side after the editor text has been set.
@@ -487,7 +545,7 @@ unsafe fn setup_status_menu(status_item: id) {
         }
 
         extern "C" fn menu_preferences(_self: &Object, _cmd: Sel, _sender: id) {
-            OPEN_PREFS_REQUESTED.store(true, Ordering::SeqCst);
+            request_open_preferences();
             unsafe {
                 let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
                 let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
@@ -630,8 +688,8 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
             }
         }
 
-        // Signal the GPUI polling task to show the window
-        SHOW_REQUESTED.store(true, Ordering::SeqCst);
+        set_pending_clipboard(read_clipboard_text());
+        request_show_window();
     }
 }
 
@@ -706,10 +764,7 @@ unsafe fn schedule_paste_with_delay() {
             }
         }
 
-        decl.add_method(
-            sel!(doPaste),
-            do_paste as extern "C" fn(&Object, Sel),
-        );
+        decl.add_method(sel!(doPaste), do_paste as extern "C" fn(&Object, Sel));
 
         decl.register()
     };

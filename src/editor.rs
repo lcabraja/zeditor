@@ -120,6 +120,7 @@ impl Cursor {
 pub struct MultiLineEditor {
     pub focus_handle: FocusHandle,
     pub lines: Vec<String>,
+    pub total_chars: usize,
     pub cursors: Vec<Cursor>,
     pub scroll_offset: Point<Pixels>,
     pub preferred_col_x: Option<Pixels>,
@@ -138,7 +139,13 @@ pub struct MultiLineEditor {
     pub needs_scroll_to_cursor: bool,
     /// Width of the line number gutter (set during paint)
     pub last_gutter_width: Pixels,
+    pub layout_revision: usize,
+    pub cached_layout_revision: usize,
+    pub cached_wrap_width: Pixels,
+    pub cached_font_size: Pixels,
+    pub cached_word_wrap: bool,
     // Cursor blink state
+    pub cursor_blink_task: Option<Task<()>>,
     pub cursor_opacity: f32,
     pub cursor_fading_in: bool,
     pub blink_epoch: usize,
@@ -151,6 +158,7 @@ impl MultiLineEditor {
         let mut editor = Self {
             focus_handle,
             lines: vec![String::new()],
+            total_chars: 0,
             cursors: vec![Cursor::new(0, 0)],
             scroll_offset: point(px(0.), px(0.)),
             preferred_col_x: None,
@@ -165,6 +173,12 @@ impl MultiLineEditor {
             last_visual_line_counts: Vec::new(),
             needs_scroll_to_cursor: false,
             last_gutter_width: px(0.),
+            layout_revision: 1,
+            cached_layout_revision: 0,
+            cached_wrap_width: px(0.),
+            cached_font_size: px(0.),
+            cached_word_wrap: false,
+            cursor_blink_task: None,
             cursor_opacity: 1.0,
             cursor_fading_in: true,
             blink_epoch: 0,
@@ -190,6 +204,8 @@ impl MultiLineEditor {
             self.cursors = vec![Cursor::new(0, 0)];
         }
 
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
         self.scroll_offset = point(px(0.), px(0.));
         self.preferred_col_x = None;
         self.marked_range = None;
@@ -240,7 +256,6 @@ impl MultiLineEditor {
         let line = c.position.line + 1;
         let col = c.position.col + 1;
         let total_lines = self.lines.len();
-        let total_chars: usize = self.lines.iter().map(|l| l.len()).sum::<usize>() + self.lines.len().saturating_sub(1); // chars + newlines
 
         // Check if there's a selection
         let has_selection = self.cursors.iter().any(|c| c.has_selection());
@@ -253,7 +268,7 @@ impl MultiLineEditor {
                     for l in start.line..=end.line {
                         selected_lines.insert(l);
                     }
-                    selected_chars += self.text_in_range(&start, &end).len();
+                    selected_chars += self.range_len(&start, &end);
                 }
             }
             let sel_lines = selected_lines.len();
@@ -273,10 +288,24 @@ impl MultiLineEditor {
                 col,
                 total_lines,
                 if total_lines == 1 { "" } else { "s" },
-                total_chars,
-                if total_chars == 1 { "" } else { "s" },
+                self.total_chars,
+                if self.total_chars == 1 { "" } else { "s" },
             )
         }
+    }
+
+    fn recalculate_total_chars(&mut self) {
+        self.total_chars = self.lines.iter().map(|line| line.len()).sum::<usize>()
+            + self.lines.len().saturating_sub(1);
+    }
+
+    fn invalidate_layout_cache(&mut self) {
+        self.layout_revision += 1;
+        self.last_shaped_lines.clear();
+        self.last_wrapped_lines.clear();
+        self.last_visual_line_counts.clear();
+        self.last_max_line_width = px(0.);
+        self.cached_layout_revision = 0;
     }
 
     pub fn has_multiple_cursors(&self) -> bool {
@@ -351,8 +380,7 @@ impl MultiLineEditor {
         if self.cursors.len() <= 1 {
             return;
         }
-        self.cursors
-            .sort_by(|a, b| a.position.cmp(&b.position));
+        self.cursors.sort_by(|a, b| a.position.cmp(&b.position));
         self.cursors.dedup_by(|a, b| {
             // If two cursors are at the same position, merge them
             if a.position == b.position {
@@ -403,11 +431,7 @@ impl MultiLineEditor {
                 prev_offset = idx;
             }
         }
-        if found_word {
-            prev_offset
-        } else {
-            0
-        }
+        if found_word { prev_offset } else { 0 }
     }
 
     fn next_word_boundary(line: &str, col: usize) -> usize {
@@ -432,7 +456,10 @@ impl MultiLineEditor {
 
     fn position_left(pos: &CursorPosition, lines: &[String]) -> CursorPosition {
         if pos.col > 0 {
-            CursorPosition::new(pos.line, Self::prev_grapheme_boundary(&lines[pos.line], pos.col))
+            CursorPosition::new(
+                pos.line,
+                Self::prev_grapheme_boundary(&lines[pos.line], pos.col),
+            )
         } else if pos.line > 0 {
             CursorPosition::new(pos.line - 1, lines[pos.line - 1].len())
         } else {
@@ -442,7 +469,10 @@ impl MultiLineEditor {
 
     fn position_right(pos: &CursorPosition, lines: &[String]) -> CursorPosition {
         if pos.col < lines[pos.line].len() {
-            CursorPosition::new(pos.line, Self::next_grapheme_boundary(&lines[pos.line], pos.col))
+            CursorPosition::new(
+                pos.line,
+                Self::next_grapheme_boundary(&lines[pos.line], pos.col),
+            )
         } else if pos.line + 1 < lines.len() {
             CursorPosition::new(pos.line + 1, 0)
         } else {
@@ -452,7 +482,10 @@ impl MultiLineEditor {
 
     fn position_word_left(pos: &CursorPosition, lines: &[String]) -> CursorPosition {
         if pos.col > 0 {
-            CursorPosition::new(pos.line, Self::prev_word_boundary(&lines[pos.line], pos.col))
+            CursorPosition::new(
+                pos.line,
+                Self::prev_word_boundary(&lines[pos.line], pos.col),
+            )
         } else if pos.line > 0 {
             CursorPosition::new(pos.line - 1, lines[pos.line - 1].len())
         } else {
@@ -462,7 +495,10 @@ impl MultiLineEditor {
 
     fn position_word_right(pos: &CursorPosition, lines: &[String]) -> CursorPosition {
         if pos.col < lines[pos.line].len() {
-            CursorPosition::new(pos.line, Self::next_word_boundary(&lines[pos.line], pos.col))
+            CursorPosition::new(
+                pos.line,
+                Self::next_word_boundary(&lines[pos.line], pos.col),
+            )
         } else if pos.line + 1 < lines.len() {
             CursorPosition::new(pos.line + 1, 0)
         } else {
@@ -549,10 +585,7 @@ impl MultiLineEditor {
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_col_x = None;
-        self.move_each_cursor(
-            |pos, _lines| CursorPosition::new(pos.line, 0),
-            cx,
-        );
+        self.move_each_cursor(|pos, _lines| CursorPosition::new(pos.line, 0), cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
@@ -576,10 +609,7 @@ impl MultiLineEditor {
 
     fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_col_x = None;
-        self.select_each_cursor(
-            |pos, _lines| CursorPosition::new(pos.line, 0),
-            cx,
-        );
+        self.select_each_cursor(|pos, _lines| CursorPosition::new(pos.line, 0), cx);
     }
 
     fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
@@ -590,7 +620,12 @@ impl MultiLineEditor {
         );
     }
 
-    fn select_document_start(&mut self, _: &SelectDocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_document_start(
+        &mut self,
+        _: &SelectDocumentStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.preferred_col_x = None;
         let pos = CursorPosition::new(0, 0);
         for c in &mut self.cursors {
@@ -604,7 +639,12 @@ impl MultiLineEditor {
         cx.notify();
     }
 
-    fn select_document_end(&mut self, _: &SelectDocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_document_end(
+        &mut self,
+        _: &SelectDocumentEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let last = self.lines.len() - 1;
         let last_col = self.lines[last].len();
         self.preferred_col_x = None;
@@ -766,6 +806,7 @@ impl MultiLineEditor {
                 a.line -= 1;
             }
         }
+        self.invalidate_layout_cache();
         self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
@@ -793,17 +834,14 @@ impl MultiLineEditor {
                 a.line += 1;
             }
         }
+        self.invalidate_layout_cache();
         self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
         cx.notify();
     }
 
     fn add_cursor_up(&mut self, _: &AddCursorUp, _: &mut Window, cx: &mut Context<Self>) {
-        let first = self
-            .cursors
-            .iter()
-            .min_by_key(|c| c.position.line)
-            .unwrap();
+        let first = self.cursors.iter().min_by_key(|c| c.position.line).unwrap();
         if first.position.line == 0 {
             return;
         }
@@ -816,11 +854,7 @@ impl MultiLineEditor {
     }
 
     fn add_cursor_down(&mut self, _: &AddCursorDown, _: &mut Window, cx: &mut Context<Self>) {
-        let last = self
-            .cursors
-            .iter()
-            .max_by_key(|c| c.position.line)
-            .unwrap();
+        let last = self.cursors.iter().max_by_key(|c| c.position.line).unwrap();
         if last.position.line + 1 >= self.lines.len() {
             return;
         }
@@ -913,11 +947,13 @@ impl MultiLineEditor {
 
     fn x_for_index_in_line(&self, line: usize, col: usize) -> Pixels {
         if self.word_wrap {
-            self.last_wrapped_lines.get(line)
+            self.last_wrapped_lines
+                .get(line)
                 .map(|wl| wl.unwrapped_layout.x_for_index(col))
                 .unwrap_or(px(0.))
         } else {
-            self.last_shaped_lines.get(line)
+            self.last_shaped_lines
+                .get(line)
                 .map(|l| l.x_for_index(col))
                 .unwrap_or(px(0.))
         }
@@ -925,11 +961,13 @@ impl MultiLineEditor {
 
     fn closest_index_for_x_in_line(&self, line: usize, x: Pixels) -> usize {
         if self.word_wrap {
-            self.last_wrapped_lines.get(line)
+            self.last_wrapped_lines
+                .get(line)
                 .map(|wl| wl.unwrapped_layout.closest_index_for_x(x))
                 .unwrap_or(0)
         } else {
-            self.last_shaped_lines.get(line)
+            self.last_shaped_lines
+                .get(line)
                 .map(|l| l.closest_index_for_x(x))
                 .unwrap_or(0)
         }
@@ -940,10 +978,11 @@ impl MultiLineEditor {
     fn move_vertically(&mut self, direction: i32, selecting: bool, cx: &mut Context<Self>) {
         // Ensure preferred_col_x is set from current position
         if self.preferred_col_x.is_none() {
-            self.preferred_col_x = Some(self.x_for_index_in_line(
-                self.cursors[0].position.line,
-                self.cursors[0].position.col,
-            ));
+            self.preferred_col_x =
+                Some(self.x_for_index_in_line(
+                    self.cursors[0].position.line,
+                    self.cursors[0].position.col,
+                ));
         }
 
         for c in &mut self.cursors {
@@ -981,11 +1020,13 @@ impl MultiLineEditor {
             // Find col from preferred_col_x
             let col = if let Some(px_x) = self.preferred_col_x {
                 if self.word_wrap {
-                    self.last_wrapped_lines.get(new_line)
+                    self.last_wrapped_lines
+                        .get(new_line)
                         .map(|wl| wl.unwrapped_layout.closest_index_for_x(px_x))
                         .unwrap_or(0)
                 } else {
-                    self.last_shaped_lines.get(new_line)
+                    self.last_shaped_lines
+                        .get(new_line)
                         .map(|l| l.closest_index_for_x(px_x))
                         .unwrap_or(c.position.col.min(self.lines[new_line].len()))
                 }
@@ -1037,17 +1078,23 @@ impl MultiLineEditor {
         result
     }
 
+    fn range_len(&self, start: &CursorPosition, end: &CursorPosition) -> usize {
+        if start.line == end.line {
+            return end.col.saturating_sub(start.col);
+        }
+
+        let mut len = self.lines[start.line].len().saturating_sub(start.col);
+        for i in (start.line + 1)..end.line {
+            len += 1 + self.lines[i].len();
+        }
+        len + 1 + end.col
+    }
+
     // --- Multi-cursor edit ---
 
-    fn insert_text_at_cursors(
-        &mut self,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn insert_text_at_cursors(&mut self, text: &str, _window: &mut Window, cx: &mut Context<Self>) {
         // Sort cursors in reverse document order (bottom-first)
-        let mut indexed: Vec<(usize, Cursor)> =
-            self.cursors.iter().cloned().enumerate().collect();
+        let mut indexed: Vec<(usize, Cursor)> = self.cursors.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.position.cmp(&a.1.position));
 
         let mut new_positions: Vec<(usize, CursorPosition)> = Vec::new();
@@ -1076,6 +1123,8 @@ impl MultiLineEditor {
 
         self.merge_overlapping_cursors();
         self.marked_range = None;
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
         self.preferred_col_x = None;
         self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
@@ -1163,8 +1212,7 @@ impl MultiLineEditor {
                 self.lines
                     .insert(pos.line + 1 + i, format!("{}{}", segment, after_cursor));
             } else {
-                self.lines
-                    .insert(pos.line + 1 + i, segment.to_string());
+                self.lines.insert(pos.line + 1 + i, segment.to_string());
             }
         }
 
@@ -1204,15 +1252,11 @@ impl MultiLineEditor {
     fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
         self.word_wrap = !self.word_wrap;
         self.scroll_offset.x = px(0.);
+        self.invalidate_layout_cache();
         cx.notify();
     }
 
-    fn on_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (delta_x, delta_y) = match event.delta {
             ScrollDelta::Pixels(d) => (-d.x, -d.y),
             ScrollDelta::Lines(d) => (-d.x * self.last_line_height, -d.y * self.last_line_height),
@@ -1241,11 +1285,13 @@ impl MultiLineEditor {
                 if y < visual_y + line_visual_height {
                     // Mouse is within this logical line's visual area
                     let local_y = y - visual_y;
-                    let local_pos = Point::new(point.x - bounds.left() - self.last_gutter_width, local_y);
+                    let local_pos =
+                        Point::new(point.x - bounds.left() - self.last_gutter_width, local_y);
                     if let Some(wl) = self.last_wrapped_lines.get(line_idx) {
-                        let col = match wl.closest_index_for_position(local_pos, self.last_line_height) {
-                            Ok(idx) | Err(idx) => idx,
-                        };
+                        let col =
+                            match wl.closest_index_for_position(local_pos, self.last_line_height) {
+                                Ok(idx) | Err(idx) => idx,
+                            };
                         return CursorPosition::new(line_idx, col);
                     }
                     return CursorPosition::new(line_idx, 0);
@@ -1264,7 +1310,9 @@ impl MultiLineEditor {
             };
 
             let col = if let Some(shaped) = self.last_shaped_lines.get(line) {
-                shaped.closest_index_for_x(point.x - bounds.left() - self.last_gutter_width + self.scroll_offset.x)
+                shaped.closest_index_for_x(
+                    point.x - bounds.left() - self.last_gutter_width + self.scroll_offset.x,
+                )
             } else {
                 0
             };
@@ -1348,7 +1396,8 @@ impl MultiLineEditor {
             }
 
             // Horizontal scroll to cursor (content area excludes gutter)
-            let cursor_x = self.last_shaped_lines
+            let cursor_x = self
+                .last_shaped_lines
                 .get(cursor_line)
                 .map(|l| l.x_for_index(cursor_col))
                 .unwrap_or(px(0.));
@@ -1367,85 +1416,83 @@ impl MultiLineEditor {
     // --- Cursor blink ---
 
     fn reset_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_blink_task = None;
         self.cursor_opacity = 1.0;
         self.cursor_fading_in = true;
         self.fade_start = None;
         self.blink_epoch += 1;
         let epoch = self.blink_epoch;
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor()
-                .timer(CURSOR_BLINK_INTERVAL)
-                .await;
+        self.cursor_blink_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                cx.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
 
-            loop {
-                let fading_in = this
-                    .update(cx, |this, cx| {
-                        if this.blink_epoch != epoch {
-                            return None;
+                loop {
+                    let fading_in = this
+                        .update(cx, |this, cx| {
+                            if this.blink_epoch != epoch {
+                                return None;
+                            }
+                            this.cursor_fading_in = !this.cursor_fading_in;
+                            this.fade_start = Some(Instant::now());
+                            cx.notify();
+                            Some(this.cursor_fading_in)
+                        })
+                        .ok()
+                        .flatten();
+
+                    let Some(fading_in) = fading_in else {
+                        break;
+                    };
+
+                    let fade_steps = (CURSOR_FADE_DURATION.as_millis()
+                        / CURSOR_ANIMATION_STEP.as_millis())
+                        as usize;
+                    for _ in 0..fade_steps {
+                        cx.background_executor().timer(CURSOR_ANIMATION_STEP).await;
+                        let should_continue = this
+                            .update(cx, |this, cx| {
+                                if this.blink_epoch != epoch {
+                                    return false;
+                                }
+                                if let Some(start) = this.fade_start {
+                                    let elapsed = start.elapsed().as_secs_f32();
+                                    let progress =
+                                        (elapsed / CURSOR_FADE_DURATION.as_secs_f32()).min(1.0);
+                                    let eased = ease_in_out_cubic(progress);
+                                    this.cursor_opacity =
+                                        if fading_in { eased } else { 1.0 - eased };
+                                    cx.notify();
+                                }
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !should_continue {
+                            return;
                         }
-                        this.cursor_fading_in = !this.cursor_fading_in;
-                        this.fade_start = Some(Instant::now());
-                        cx.notify();
-                        Some(this.cursor_fading_in)
-                    })
-                    .ok()
-                    .flatten();
+                    }
 
-                let Some(fading_in) = fading_in else {
-                    break;
-                };
-
-                let fade_steps = (CURSOR_FADE_DURATION.as_millis()
-                    / CURSOR_ANIMATION_STEP.as_millis())
-                    as usize;
-                for _ in 0..fade_steps {
-                    cx.background_executor()
-                        .timer(CURSOR_ANIMATION_STEP)
-                        .await;
                     let should_continue = this
                         .update(cx, |this, cx| {
                             if this.blink_epoch != epoch {
                                 return false;
                             }
-                            if let Some(start) = this.fade_start {
-                                let elapsed = start.elapsed().as_secs_f32();
-                                let progress =
-                                    (elapsed / CURSOR_FADE_DURATION.as_secs_f32()).min(1.0);
-                                let eased = ease_in_out_cubic(progress);
-                                this.cursor_opacity =
-                                    if fading_in { eased } else { 1.0 - eased };
-                                cx.notify();
-                            }
+                            this.cursor_opacity = if fading_in { 1.0 } else { 0.0 };
+                            this.fade_start = None;
+                            cx.notify();
                             true
                         })
                         .unwrap_or(false);
                     if !should_continue {
-                        return;
+                        break;
+                    }
+
+                    let remaining = CURSOR_BLINK_INTERVAL.saturating_sub(CURSOR_FADE_DURATION);
+                    if !remaining.is_zero() {
+                        cx.background_executor().timer(remaining).await;
                     }
                 }
-
-                let should_continue = this
-                    .update(cx, |this, cx| {
-                        if this.blink_epoch != epoch {
-                            return false;
-                        }
-                        this.cursor_opacity = if fading_in { 1.0 } else { 0.0 };
-                        this.fade_start = None;
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !should_continue {
-                    break;
-                }
-
-                let remaining = CURSOR_BLINK_INTERVAL.saturating_sub(CURSOR_FADE_DURATION);
-                if !remaining.is_zero() {
-                    cx.background_executor().timer(remaining).await;
-                }
-            }
-        })
-        .detach();
+            },
+        ));
     }
 
     // --- UTF-16 conversions for IME ---
@@ -1510,11 +1557,7 @@ impl EntityInputHandler for MultiLineEditor {
         let flat = self.flat_text();
         let range = self.flat_selected_range();
         let c = &self.cursors[0];
-        let reversed = c
-            .anchor
-            .as_ref()
-            .map(|a| *a > c.position)
-            .unwrap_or(false);
+        let reversed = c.anchor.as_ref().map(|a| *a > c.position).unwrap_or(false);
         Some(UTF16Selection {
             range: Self::range_to_utf16(&flat, &range),
             reversed,
@@ -1558,6 +1601,8 @@ impl EntityInputHandler for MultiLineEditor {
 
         self.cursors = vec![Cursor::new(new_pos.line, new_pos.col)];
         self.marked_range = None;
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
         self.preferred_col_x = None;
         self.needs_scroll_to_cursor = true;
         self.reset_cursor_blink(cx);
@@ -1606,6 +1651,8 @@ impl EntityInputHandler for MultiLineEditor {
             self.cursors = vec![Cursor::new(new_end.line, new_end.col)];
         }
 
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
         self.needs_scroll_to_cursor = true;
         cx.notify();
     }
@@ -1713,16 +1760,11 @@ impl Render for MultiLineEditor {
             .font_family("JetBrains Mono")
             .line_height(px(24.))
             .text_size(px(14.))
-            .child(
-                div()
-                    .w_full()
-                    .flex_1()
-                    .overflow_hidden()
-                    .p(px(8.))
-                    .child(MultiLineTextElement {
-                        input: cx.entity().clone(),
-                    }),
-            )
+            .child(div().w_full().flex_1().overflow_hidden().p(px(8.)).child(
+                MultiLineTextElement {
+                    input: cx.entity().clone(),
+                },
+            ))
     }
 }
 
@@ -1749,6 +1791,8 @@ struct MultiLinePrepaintState {
     selections: Vec<PaintQuad>,
     scroll_offset: Point<Pixels>,
     line_height: Pixels,
+    font_size: Pixels,
+    content_width: Pixels,
     gutter_width: Pixels,
     gutter_line_numbers: Vec<(ShapedLine, Pixels)>, // (shaped number, y position)
 }
@@ -1790,102 +1834,177 @@ impl Element for MultiLineTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let input = self.input.read(cx);
-        let theme = cx.global::<Theme>();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
-        let scroll_offset = input.scroll_offset;
-        let cursor_opacity = input.cursor_opacity;
-        let word_wrap = input.word_wrap;
+        let (gutter_color, accent_color) = {
+            let theme = cx.global::<Theme>();
+            (theme.overlay0, theme.accent)
+        };
 
         // Calculate gutter width based on number of digits in max line number
-        let line_count = input.lines.len();
-        let digit_count = if line_count == 0 { 1 } else { (line_count as f64).log10().floor() as usize + 1 };
+        let line_count = self.input.read(cx).lines.len();
+        let digit_count = if line_count == 0 {
+            1
+        } else {
+            (line_count as f64).log10().floor() as usize + 1
+        };
         let sample_text: SharedString = "8".repeat(digit_count).into();
         let gutter_run = TextRun {
             len: sample_text.len(),
             font: style.font(),
-            color: theme.overlay0.into(),
+            color: gutter_color.into(),
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let sample_shaped = window.text_system().shape_line(sample_text, font_size, &[gutter_run], None);
+        let sample_shaped =
+            window
+                .text_system()
+                .shape_line(sample_text, font_size, &[gutter_run], None);
         let gutter_padding = px(16.); // padding after line numbers
         let gutter_width = sample_shaped.width + gutter_padding;
 
         let content_left = bounds.left() + gutter_width;
         let content_width = bounds.size.width - gutter_width;
 
-        let mut shaped_lines = Vec::new();
-        let mut wrapped_lines = Vec::new();
-        let mut visual_line_counts = Vec::with_capacity(input.lines.len());
-        let mut max_line_width = px(0.);
-
-        if word_wrap {
-            // Shape with wrapping — wrap within content area
-            let wrap_width = content_width;
-            for line_text in &input.lines {
-                let display_text: SharedString = if line_text.is_empty() {
-                    " ".into()
+        let (
+            scroll_offset,
+            cursor_opacity,
+            word_wrap,
+            focus_handle,
+            cursors,
+            line_lengths,
+            lines_to_shape,
+            mut shaped_lines,
+            mut wrapped_lines,
+            mut visual_line_counts,
+            mut max_line_width,
+        ) = self.input.update(cx, |input, _cx| {
+            let cache_valid = input.cached_layout_revision == input.layout_revision
+                && input.cached_word_wrap == input.word_wrap
+                && input.cached_font_size == font_size
+                && (!input.word_wrap || input.cached_wrap_width == content_width)
+                && input.last_visual_line_counts.len() == input.lines.len()
+                && if input.word_wrap {
+                    input.last_wrapped_lines.len() == input.lines.len()
                 } else {
-                    line_text.clone().into()
+                    input.last_shaped_lines.len() == input.lines.len()
                 };
-                let run = TextRun {
-                    len: display_text.len(),
-                    font: style.font(),
-                    color: style.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let result = window
-                    .text_system()
-                    .shape_text(display_text, font_size, &[run], Some(wrap_width), None);
-                if let Ok(mut lines) = result {
-                    if let Some(wl) = lines.pop() {
-                        let count = wl.wrap_boundaries.len() + 1;
-                        visual_line_counts.push(count);
-                        wrapped_lines.push(wl);
+
+            let lines_to_shape = if cache_valid {
+                None
+            } else {
+                Some(input.lines.clone())
+            };
+
+            let shaped_lines = if cache_valid && !input.word_wrap {
+                std::mem::take(&mut input.last_shaped_lines)
+            } else {
+                Vec::new()
+            };
+
+            let wrapped_lines = if cache_valid && input.word_wrap {
+                std::mem::take(&mut input.last_wrapped_lines)
+            } else {
+                Vec::new()
+            };
+
+            (
+                input.scroll_offset,
+                input.cursor_opacity,
+                input.word_wrap,
+                input.focus_handle.clone(),
+                input.cursors.clone(),
+                input
+                    .lines
+                    .iter()
+                    .map(|line| line.len())
+                    .collect::<Vec<_>>(),
+                lines_to_shape,
+                shaped_lines,
+                wrapped_lines,
+                if cache_valid {
+                    input.last_visual_line_counts.clone()
+                } else {
+                    Vec::new()
+                },
+                if cache_valid {
+                    input.last_max_line_width
+                } else {
+                    px(0.)
+                },
+            )
+        });
+
+        if let Some(lines_to_shape) = lines_to_shape {
+            visual_line_counts = Vec::with_capacity(lines_to_shape.len());
+            if word_wrap {
+                let wrap_width = content_width;
+                for line_text in &lines_to_shape {
+                    let display_text: SharedString = if line_text.is_empty() {
+                        " ".into()
+                    } else {
+                        line_text.clone().into()
+                    };
+                    let run = TextRun {
+                        len: display_text.len(),
+                        font: style.font(),
+                        color: style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let result = window.text_system().shape_text(
+                        display_text,
+                        font_size,
+                        &[run],
+                        Some(wrap_width),
+                        None,
+                    );
+                    if let Ok(mut lines) = result {
+                        if let Some(wl) = lines.pop() {
+                            let count = wl.wrap_boundaries.len() + 1;
+                            visual_line_counts.push(count);
+                            wrapped_lines.push(wl);
+                        } else {
+                            visual_line_counts.push(1);
+                            wrapped_lines.push(WrappedLine::default());
+                        }
                     } else {
                         visual_line_counts.push(1);
                         wrapped_lines.push(WrappedLine::default());
                     }
-                } else {
+                }
+            } else {
+                for line_text in &lines_to_shape {
+                    let display_text: SharedString = if line_text.is_empty() {
+                        " ".into()
+                    } else {
+                        line_text.clone().into()
+                    };
+                    let run = TextRun {
+                        len: display_text.len(),
+                        font: style.font(),
+                        color: style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped =
+                        window
+                            .text_system()
+                            .shape_line(display_text, font_size, &[run], None);
+                    if shaped.width > max_line_width {
+                        max_line_width = shaped.width;
+                    }
+                    shaped_lines.push(shaped);
                     visual_line_counts.push(1);
-                    wrapped_lines.push(WrappedLine::default());
                 }
-            }
-        } else {
-            // Shape without wrapping
-            for line_text in &input.lines {
-                let display_text: SharedString = if line_text.is_empty() {
-                    " ".into()
-                } else {
-                    line_text.clone().into()
-                };
-                let run = TextRun {
-                    len: display_text.len(),
-                    font: style.font(),
-                    color: style.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = window
-                    .text_system()
-                    .shape_line(display_text, font_size, &[run], None);
-                if shaped.width > max_line_width {
-                    max_line_width = shaped.width;
-                }
-                shaped_lines.push(shaped);
-                visual_line_counts.push(1);
             }
         }
 
         // Shape line numbers
-        let gutter_color = theme.overlay0;
         let mut gutter_line_numbers = Vec::with_capacity(line_count);
         let mut visual_y = px(0.);
         for (i, &vcount) in visual_line_counts.iter().enumerate() {
@@ -1902,7 +2021,10 @@ impl Element for MultiLineTextElement {
                     underline: None,
                     strikethrough: None,
                 };
-                let shaped_num = window.text_system().shape_line(num_str, font_size, &[num_run], None);
+                let shaped_num =
+                    window
+                        .text_system()
+                        .shape_line(num_str, font_size, &[num_run], None);
                 gutter_line_numbers.push((shaped_num, y));
             }
             visual_y += visual_height;
@@ -1911,7 +2033,7 @@ impl Element for MultiLineTextElement {
         // Build cursor rects and selection rects
         let mut cursor_rects = Vec::new();
         let mut selections = Vec::new();
-        let is_focused = input.focus_handle.is_focused(window);
+        let is_focused = focus_handle.is_focused(window);
 
         // Helper: compute the visual Y offset for a logical line
         let visual_y_for_line = |line: usize| -> Pixels {
@@ -1921,7 +2043,7 @@ impl Element for MultiLineTextElement {
 
         if word_wrap {
             // Wrapped mode: use WrappedLineLayout position_for_index
-            for c in &input.cursors {
+            for c in &cursors {
                 let base_y = visual_y_for_line(c.position.line);
                 let (cx_offset, cy_offset) = if let Some(wl) = wrapped_lines.get(c.position.line) {
                     if let Some(pos) = wl.position_for_index(c.position.col, line_height) {
@@ -1941,27 +2063,47 @@ impl Element for MultiLineTextElement {
                 if !c.has_selection() && is_focused {
                     cursor_rects.push((
                         Bounds::new(cursor_screen, size(px(2.), line_height)),
-                        theme.accent,
+                        accent_color,
                     ));
                 }
 
                 if let Some((start, end)) = c.selection_range() {
                     // For wrapped selections, paint per-visual-line segments
-                    for line_idx in start.line..=end.line {
+                    for (line_idx, line_len) in line_lengths
+                        .iter()
+                        .enumerate()
+                        .take(end.line + 1)
+                        .skip(start.line)
+                    {
                         let col_start = if line_idx == start.line { start.col } else { 0 };
-                        let col_end = if line_idx == end.line { end.col } else { input.lines[line_idx].len() };
+                        let col_end = if line_idx == end.line {
+                            end.col
+                        } else {
+                            *line_len
+                        };
                         let base = visual_y_for_line(line_idx);
 
                         if let Some(wl) = wrapped_lines.get(line_idx) {
-                            let start_pos = wl.position_for_index(col_start, line_height).unwrap_or(point(px(0.), px(0.)));
-                            let end_pos = wl.position_for_index(col_end, line_height).unwrap_or(point(px(0.), px(0.)));
+                            let start_pos = wl
+                                .position_for_index(col_start, line_height)
+                                .unwrap_or(point(px(0.), px(0.)));
+                            let end_pos = wl
+                                .position_for_index(col_end, line_height)
+                                .unwrap_or(point(px(0.), px(0.)));
 
                             if start_pos.y == end_pos.y {
                                 // Same visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(content_left + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
-                                        point(content_left + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                        point(
+                                            content_left + start_pos.x,
+                                            bounds.top() + base + start_pos.y - scroll_offset.y,
+                                        ),
+                                        point(
+                                            content_left + end_pos.x,
+                                            bounds.top() + base + end_pos.y + line_height
+                                                - scroll_offset.y,
+                                        ),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
@@ -1970,8 +2112,15 @@ impl Element for MultiLineTextElement {
                                 // First visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(content_left + start_pos.x, bounds.top() + base + start_pos.y - scroll_offset.y),
-                                        point(content_left + content_width, bounds.top() + base + start_pos.y + line_height - scroll_offset.y),
+                                        point(
+                                            content_left + start_pos.x,
+                                            bounds.top() + base + start_pos.y - scroll_offset.y,
+                                        ),
+                                        point(
+                                            content_left + content_width,
+                                            bounds.top() + base + start_pos.y + line_height
+                                                - scroll_offset.y,
+                                        ),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
@@ -1982,8 +2131,15 @@ impl Element for MultiLineTextElement {
                                     let vy = line_height * vl;
                                     selections.push(fill(
                                         Bounds::from_corners(
-                                            point(content_left, bounds.top() + base + vy - scroll_offset.y),
-                                            point(content_left + content_width, bounds.top() + base + vy + line_height - scroll_offset.y),
+                                            point(
+                                                content_left,
+                                                bounds.top() + base + vy - scroll_offset.y,
+                                            ),
+                                            point(
+                                                content_left + content_width,
+                                                bounds.top() + base + vy + line_height
+                                                    - scroll_offset.y,
+                                            ),
                                         ),
                                         rgba(0x3311ff30),
                                     ));
@@ -1991,8 +2147,15 @@ impl Element for MultiLineTextElement {
                                 // Last visual line
                                 selections.push(fill(
                                     Bounds::from_corners(
-                                        point(content_left, bounds.top() + base + end_pos.y - scroll_offset.y),
-                                        point(content_left + end_pos.x, bounds.top() + base + end_pos.y + line_height - scroll_offset.y),
+                                        point(
+                                            content_left,
+                                            bounds.top() + base + end_pos.y - scroll_offset.y,
+                                        ),
+                                        point(
+                                            content_left + end_pos.x,
+                                            bounds.top() + base + end_pos.y + line_height
+                                                - scroll_offset.y,
+                                        ),
                                     ),
                                     rgba(0x3311ff30),
                                 ));
@@ -2004,7 +2167,7 @@ impl Element for MultiLineTextElement {
                     if is_focused {
                         cursor_rects.push((
                             Bounds::new(cursor_screen, size(px(2.), line_height)),
-                            theme.accent,
+                            accent_color,
                         ));
                     }
                 }
@@ -2012,7 +2175,7 @@ impl Element for MultiLineTextElement {
         } else {
             // Non-wrapped mode: use ShapedLine x_for_index
             if is_focused {
-                for c in &input.cursors {
+                for c in &cursors {
                     if !c.has_selection() {
                         let x = shaped_lines
                             .get(c.position.line)
@@ -2027,40 +2190,67 @@ impl Element for MultiLineTextElement {
                                 ),
                                 size(px(2.), line_height),
                             ),
-                            theme.accent,
+                            accent_color,
                         ));
                     }
                 }
             }
 
-            for c in &input.cursors {
+            for c in &cursors {
                 if let Some((start, end)) = c.selection_range() {
-                    for line_idx in start.line..=end.line {
+                    for (line_idx, line_len) in line_lengths
+                        .iter()
+                        .enumerate()
+                        .take(end.line + 1)
+                        .skip(start.line)
+                    {
                         let col_start = if line_idx == start.line { start.col } else { 0 };
-                        let col_end = if line_idx == end.line { end.col } else { input.lines[line_idx].len() };
+                        let col_end = if line_idx == end.line {
+                            end.col
+                        } else {
+                            *line_len
+                        };
 
-                        let x_start = shaped_lines.get(line_idx).map(|l| l.x_for_index(col_start)).unwrap_or(px(0.));
-                        let x_end = shaped_lines.get(line_idx).map(|l| l.x_for_index(col_end)).unwrap_or(px(0.));
+                        let x_start = shaped_lines
+                            .get(line_idx)
+                            .map(|l| l.x_for_index(col_start))
+                            .unwrap_or(px(0.));
+                        let x_end = shaped_lines
+                            .get(line_idx)
+                            .map(|l| l.x_for_index(col_end))
+                            .unwrap_or(px(0.));
                         let y = line_height * line_idx;
 
                         selections.push(fill(
                             Bounds::from_corners(
-                                point(content_left + x_start - scroll_offset.x, bounds.top() + y - scroll_offset.y),
-                                point(content_left + x_end - scroll_offset.x, bounds.top() + y + line_height - scroll_offset.y),
+                                point(
+                                    content_left + x_start - scroll_offset.x,
+                                    bounds.top() + y - scroll_offset.y,
+                                ),
+                                point(
+                                    content_left + x_end - scroll_offset.x,
+                                    bounds.top() + y + line_height - scroll_offset.y,
+                                ),
                             ),
                             rgba(0x3311ff30),
                         ));
                     }
 
                     if is_focused {
-                        let x = shaped_lines.get(c.position.line).map(|l| l.x_for_index(c.position.col)).unwrap_or(px(0.));
+                        let x = shaped_lines
+                            .get(c.position.line)
+                            .map(|l| l.x_for_index(c.position.col))
+                            .unwrap_or(px(0.));
                         let y = line_height * c.position.line;
                         cursor_rects.push((
                             Bounds::new(
-                                point(content_left + x - scroll_offset.x, bounds.top() + y - scroll_offset.y),
+                                point(
+                                    content_left + x - scroll_offset.x,
+                                    bounds.top() + y - scroll_offset.y,
+                                ),
                                 size(px(2.), line_height),
                             ),
-                            theme.accent,
+                            accent_color,
                         ));
                     }
                 }
@@ -2078,6 +2268,8 @@ impl Element for MultiLineTextElement {
             selections,
             scroll_offset,
             line_height,
+            font_size,
+            content_width,
             gutter_width,
             gutter_line_numbers,
         }
@@ -2168,6 +2360,9 @@ impl Element for MultiLineTextElement {
         let wrapped_lines: Vec<WrappedLine> = prepaint.wrapped_lines.drain(..).collect();
         let visual_line_counts = prepaint.visual_line_counts.clone();
         let max_line_width = prepaint.max_line_width;
+        let font_size = prepaint.font_size;
+        let content_width = prepaint.content_width;
+        let word_wrap = prepaint.word_wrap;
         self.input.update(cx, |input, cx| {
             input.last_shaped_lines = shaped_lines;
             input.last_wrapped_lines = wrapped_lines;
@@ -2176,6 +2371,10 @@ impl Element for MultiLineTextElement {
             input.last_bounds = Some(bounds);
             input.last_line_height = line_height;
             input.last_gutter_width = gutter_width;
+            input.cached_layout_revision = input.layout_revision;
+            input.cached_wrap_width = content_width;
+            input.cached_font_size = font_size;
+            input.cached_word_wrap = word_wrap;
             // Apply scroll_to_cursor with fresh layout data when cursor moved
             if input.needs_scroll_to_cursor {
                 input.needs_scroll_to_cursor = false;

@@ -14,11 +14,14 @@ use preferences_window::*;
 use theme::*;
 
 #[cfg(target_os = "macos")]
-use raw_window_handle::HasWindowHandle;
-#[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
+#[cfg(target_os = "macos")]
+use raw_window_handle::HasWindowHandle;
 
-actions!(popup_editor, [Quit, Escape, SubmitAndPaste, OpenPreferences]);
+actions!(
+    popup_editor,
+    [Quit, Escape, SubmitAndPaste, OpenPreferences]
+);
 
 pub struct PopupEditor {
     editor: Entity<MultiLineEditor>,
@@ -41,10 +44,10 @@ impl PopupEditor {
         // Check for CLI/pipe initial text first
         #[cfg(target_os = "macos")]
         if let Some(initial_text) = hotkey::take_pending_clipboard() {
-            let hash = Self::hash_str(&initial_text);
+            let hash = initial_text.as_deref().map(Self::hash_str).unwrap_or(0);
             self.last_clipboard_hash = hash;
             self.editor.update(cx, |editor, cx| {
-                editor.reset_with_text(Some(initial_text), cx);
+                editor.reset_with_text(initial_text, cx);
             });
             return;
         }
@@ -88,7 +91,12 @@ impl PopupEditor {
     }
 
     #[cfg(target_os = "macos")]
-    fn submit_and_paste(&mut self, _: &SubmitAndPaste, _window: &mut Window, cx: &mut Context<Self>) {
+    fn submit_and_paste(
+        &mut self,
+        _: &SubmitAndPaste,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = self.editor.read(cx).get_submit_text();
         unsafe {
             hotkey::submit_and_paste(&text);
@@ -96,17 +104,33 @@ impl PopupEditor {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn submit_and_paste(&mut self, _: &SubmitAndPaste, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn submit_and_paste(
+        &mut self,
+        _: &SubmitAndPaste,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
         // No-op on other platforms
     }
 
     #[cfg(target_os = "macos")]
-    fn open_preferences(&mut self, _: &OpenPreferences, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_preferences(
+        &mut self,
+        _: &OpenPreferences,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         open_preferences_window(cx);
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn open_preferences(&mut self, _: &OpenPreferences, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn open_preferences(
+        &mut self,
+        _: &OpenPreferences,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 }
 
 impl Render for PopupEditor {
@@ -177,7 +201,9 @@ fn main() {
             let text = args[1..].join(" ");
             hotkey::set_initial_text(text);
         } else {
-            unsafe extern "C" { fn isatty(fd: i32) -> i32; }
+            unsafe extern "C" {
+                fn isatty(fd: i32) -> i32;
+            }
             let is_tty = unsafe { isatty(0) != 0 };
             if !is_tty {
                 use std::io::Read;
@@ -327,31 +353,26 @@ fn main() {
                 })
                 .ok();
 
-            // Poll for preferences window requests from the menu bar
+            // Wait for hotkey/menu requests without busy polling.
             cx.spawn(async move |cx: &mut AsyncApp| {
                 loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(100))
+                    let requests = cx
+                        .background_executor()
+                        .await_on_background(async { hotkey::wait_for_requests() })
                         .await;
-                    if hotkey::is_prefs_requested() {
+
+                    if requests.open_preferences {
                         cx.update(|cx| {
                             open_preferences_window(cx);
                         });
                     }
-                }
-            })
-            .detach();
 
-            // Poll for show-window requests: check clipboard, then show
-            cx.spawn(async move |cx: &mut AsyncApp| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(10))
-                        .await;
-                    if hotkey::is_show_requested() {
-                        window_handle.update(cx, |root: &mut PopupEditor, _window, cx| {
-                            root.on_show(cx);
-                        }).ok();
+                    if requests.show_window {
+                        window_handle
+                            .update(cx, |root: &mut PopupEditor, _window, cx| {
+                                root.on_show(cx);
+                            })
+                            .ok();
                         unsafe { hotkey::show_window_now() };
                     }
                 }
@@ -379,11 +400,7 @@ fn open_preferences_window(cx: &mut App) {
         ..Default::default()
     };
 
-    let _ = cx.open_window(options, |_window, cx| {
-        cx.new(|cx| {
-            PreferencesWindow::new(cx)
-        })
-    });
+    let _ = cx.open_window(options, |_window, cx| cx.new(PreferencesWindow::new));
 }
 
 #[cfg(target_os = "macos")]

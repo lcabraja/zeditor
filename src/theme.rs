@@ -31,7 +31,9 @@ impl Global for Theme {}
 fn get_system_accent_color() -> Rgba {
     let accent_color: Retained<NSColor> = NSColor::controlAccentColor();
     // Convert to sRGB color space
-    if let Some(rgb_color) = accent_color.colorUsingColorSpace(objc2_app_kit::NSColorSpace::sRGBColorSpace().as_ref()) {
+    if let Some(rgb_color) =
+        accent_color.colorUsingColorSpace(objc2_app_kit::NSColorSpace::sRGBColorSpace().as_ref())
+    {
         let r = rgb_color.redComponent() as f32;
         let g = rgb_color.greenComponent() as f32;
         let b = rgb_color.blueComponent() as f32;

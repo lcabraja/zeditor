@@ -12,7 +12,7 @@ pub struct HotkeyConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key_code: 0x0E,      // 'E'
+            key_code: 0x0E,                 // 'E'
             modifiers: (1 << 8) | (1 << 9), // Cmd + Shift
             display_string: "Cmd+Shift+E".to_string(),
         }
@@ -23,7 +23,6 @@ impl Default for HotkeyConfig {
 pub struct Preferences {
     pub hotkey: HotkeyConfig,
 }
-
 
 impl Global for Preferences {}
 
