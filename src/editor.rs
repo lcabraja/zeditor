@@ -308,6 +308,33 @@ impl MultiLineEditor {
         self.cached_layout_revision = 0;
     }
 
+    fn request_scroll_to_cursor(&mut self) {
+        self.needs_scroll_to_cursor = true;
+        if self.try_scroll_to_cursor() {
+            self.needs_scroll_to_cursor = false;
+        }
+    }
+
+    fn try_scroll_to_cursor(&mut self) -> bool {
+        if self.last_bounds.is_none() {
+            return false;
+        }
+
+        let has_layout = if self.word_wrap {
+            self.last_wrapped_lines.len() == self.lines.len()
+                && self.last_visual_line_counts.len() == self.lines.len()
+        } else {
+            self.last_shaped_lines.len() == self.lines.len()
+        };
+
+        if !has_layout {
+            return false;
+        }
+
+        self.scroll_to_cursor();
+        true
+    }
+
     pub fn has_multiple_cursors(&self) -> bool {
         self.cursors.len() > 1
     }
@@ -331,7 +358,7 @@ impl MultiLineEditor {
         let pos = self.clamp_position(&pos);
         self.cursors = vec![Cursor::new(pos.line, pos.col)];
         self.preferred_col_x = None;
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -343,7 +370,7 @@ impl MultiLineEditor {
             c.anchor = Some(c.position.clone());
         }
         c.position = pos;
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         cx.notify();
     }
 
@@ -356,7 +383,7 @@ impl MultiLineEditor {
             c.anchor = None;
         }
         self.merge_overlapping_cursors();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -372,7 +399,7 @@ impl MultiLineEditor {
             c.position = f(&c.position, &self.lines);
         }
         self.merge_overlapping_cursors();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         cx.notify();
     }
 
@@ -519,7 +546,7 @@ impl MultiLineEditor {
             }
             self.merge_overlapping_cursors();
             self.preferred_col_x = None;
-            self.needs_scroll_to_cursor = true;
+            self.request_scroll_to_cursor();
             self.reset_cursor_blink(cx);
             cx.notify();
         } else {
@@ -538,7 +565,7 @@ impl MultiLineEditor {
             }
             self.merge_overlapping_cursors();
             self.preferred_col_x = None;
-            self.needs_scroll_to_cursor = true;
+            self.request_scroll_to_cursor();
             self.reset_cursor_blink(cx);
             cx.notify();
         } else {
@@ -635,7 +662,7 @@ impl MultiLineEditor {
             c.position = pos.clone();
         }
         self.merge_overlapping_cursors();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         cx.notify();
     }
 
@@ -656,7 +683,7 @@ impl MultiLineEditor {
             c.position = pos.clone();
         }
         self.merge_overlapping_cursors();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         cx.notify();
     }
 
@@ -807,7 +834,7 @@ impl MultiLineEditor {
             }
         }
         self.invalidate_layout_cache();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -835,7 +862,7 @@ impl MultiLineEditor {
             }
         }
         self.invalidate_layout_cache();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1045,7 +1072,7 @@ impl MultiLineEditor {
         }
 
         self.merge_overlapping_cursors();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1126,7 +1153,7 @@ impl MultiLineEditor {
         self.recalculate_total_chars();
         self.invalidate_layout_cache();
         self.preferred_col_x = None;
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1604,7 +1631,7 @@ impl EntityInputHandler for MultiLineEditor {
         self.recalculate_total_chars();
         self.invalidate_layout_cache();
         self.preferred_col_x = None;
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
     }
@@ -1653,7 +1680,7 @@ impl EntityInputHandler for MultiLineEditor {
 
         self.recalculate_total_chars();
         self.invalidate_layout_cache();
-        self.needs_scroll_to_cursor = true;
+        self.request_scroll_to_cursor();
         cx.notify();
     }
 
@@ -2286,73 +2313,106 @@ impl Element for MultiLineTextElement {
         cx: &mut App,
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
+        let gutter_background: Hsla = {
+            let theme = cx.global::<Theme>();
+            theme.surface0.into()
+        };
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
 
-        // Paint selections
-        for sel in prepaint.selections.drain(..) {
-            window.paint_quad(sel);
-        }
-
         let line_height = prepaint.line_height;
         let scroll_offset = prepaint.scroll_offset;
         let gutter_width = prepaint.gutter_width;
         let content_left = bounds.left() + gutter_width;
+        let content_bounds = Bounds::new(
+            point(content_left, bounds.top()),
+            size(prepaint.content_width, bounds.size.height),
+        );
 
-        // Paint line numbers in the gutter (right-aligned)
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: content_bounds,
+            }),
+            |window| {
+                // Paint selections
+                for sel in prepaint.selections.drain(..) {
+                    window.paint_quad(sel);
+                }
+
+                if prepaint.word_wrap {
+                    // Paint wrapped lines
+                    let mut visual_y = px(0.);
+                    for (i, wrapped) in prepaint.wrapped_lines.iter().enumerate() {
+                        let visual_height = line_height * prepaint.visual_line_counts[i];
+                        let y = bounds.top() + visual_y - scroll_offset.y;
+                        // Skip lines outside visible bounds
+                        if y + visual_height >= bounds.top() && y <= bounds.bottom() {
+                            let origin = point(content_left, y);
+                            wrapped
+                                .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                                .ok();
+                        }
+                        visual_y += visual_height;
+                    }
+                } else {
+                    // Paint unwrapped lines
+                    for (i, shaped) in prepaint.shaped_lines.iter().enumerate() {
+                        let y = bounds.top() + line_height * i - scroll_offset.y;
+                        if y + line_height < bounds.top() || y > bounds.bottom() {
+                            continue;
+                        }
+                        let origin = point(content_left - scroll_offset.x, y);
+                        shaped
+                            .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                            .ok();
+                    }
+                }
+
+                if !prepaint.word_wrap
+                    && scroll_offset.x > px(0.)
+                    && prepaint.content_width > px(0.)
+                {
+                    let fade_width = (prepaint.font_size * 3.75).min(prepaint.content_width);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(content_left, bounds.top()),
+                            size(fade_width, bounds.size.height),
+                        ),
+                        linear_gradient(
+                            90.,
+                            linear_color_stop(gutter_background, 0.0),
+                            linear_color_stop(gutter_background.opacity(0.0), 1.0),
+                        ),
+                    ));
+                }
+
+                // Paint cursors
+                let opacity = prepaint.cursor_opacity;
+                if opacity > 0.0 && focus_handle.is_focused(window) {
+                    for (cursor_bounds, cursor_color) in &prepaint.cursors {
+                        let hsla: Hsla = (*cursor_color).into();
+                        let color_with_opacity = Hsla {
+                            h: hsla.h,
+                            s: hsla.s,
+                            l: hsla.l,
+                            a: opacity,
+                        };
+                        window.paint_quad(fill(*cursor_bounds, color_with_opacity));
+                    }
+                }
+            },
+        );
+
+        // Paint line numbers in the gutter (right-aligned) after text and fade mask.
         for (shaped_num, y) in &prepaint.gutter_line_numbers {
             let num_x = bounds.left() + gutter_width - px(16.) - shaped_num.width;
             let origin = point(num_x, bounds.top() + *y);
             shaped_num
                 .paint(origin, line_height, TextAlign::Left, None, window, cx)
                 .ok();
-        }
-
-        if prepaint.word_wrap {
-            // Paint wrapped lines
-            let mut visual_y = px(0.);
-            for (i, wrapped) in prepaint.wrapped_lines.iter().enumerate() {
-                let visual_height = line_height * prepaint.visual_line_counts[i];
-                let y = bounds.top() + visual_y - scroll_offset.y;
-                // Skip lines outside visible bounds
-                if y + visual_height >= bounds.top() && y <= bounds.bottom() {
-                    let origin = point(content_left, y);
-                    wrapped
-                        .paint(origin, line_height, TextAlign::Left, None, window, cx)
-                        .ok();
-                }
-                visual_y += visual_height;
-            }
-        } else {
-            // Paint unwrapped lines
-            for (i, shaped) in prepaint.shaped_lines.iter().enumerate() {
-                let y = bounds.top() + line_height * i - scroll_offset.y;
-                if y + line_height < bounds.top() || y > bounds.bottom() {
-                    continue;
-                }
-                let origin = point(content_left - scroll_offset.x, y);
-                shaped
-                    .paint(origin, line_height, TextAlign::Left, None, window, cx)
-                    .ok();
-            }
-        }
-
-        // Paint cursors
-        let opacity = prepaint.cursor_opacity;
-        if opacity > 0.0 && focus_handle.is_focused(window) {
-            for (cursor_bounds, cursor_color) in &prepaint.cursors {
-                let hsla: Hsla = (*cursor_color).into();
-                let color_with_opacity = Hsla {
-                    h: hsla.h,
-                    s: hsla.s,
-                    l: hsla.l,
-                    a: opacity,
-                };
-                window.paint_quad(fill(*cursor_bounds, color_with_opacity));
-            }
         }
 
         // Update cached layout info

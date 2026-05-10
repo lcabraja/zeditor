@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="crimson" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#dc3545"/>
+      <stop offset="100%" style="stop-color:#b52533"/>
+    </linearGradient>
+    <linearGradient id="headerSheen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff" stop-opacity="0.12"/>
+      <stop offset="100%" style="stop-color:#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff" stop-opacity="0.06"/>
+      <stop offset="50%" style="stop-color:#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+    <filter id="cursorGlow" x="-100%" y="-50%" width="300%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <clipPath id="docClip">
+      <rect x="14" y="18" width="100" height="92" rx="6"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background — square, Apple will mask corners -->
+  <rect x="0" y="0" width="128" height="128" fill="url(#bg)"/>
+
+  <!-- Top sheen overlay -->
+  <rect x="0" y="0" width="128" height="64" fill="url(#sheen)"/>
+
+  <!-- Ambient glow -->
+  <ellipse cx="64" cy="30" rx="48" ry="18" fill="#dc3545" opacity="0.06"/>
+
+  <!-- Document card -->
+  <g filter="url(#cardShadow)">
+    <rect x="14" y="18" width="100" height="92" rx="6" fill="#1e1e38"/>
+  </g>
+
+  <g clip-path="url(#docClip)">
+    <!-- Header bar (23px, matching spreadsheet) -->
+    <rect x="14" y="18" width="100" height="23" fill="url(#crimson)"/>
+    <rect x="14" y="18" width="100" height="11" fill="url(#headerSheen)"/>
+
+    <!-- Header title — centered at y=27 -->
+    <rect x="22" y="27" width="32" height="5" rx="2" fill="#fff" opacity="0.85"/>
+
+    <!-- Line 1 — <div> tag -->
+    <rect x="22" y="48" width="44" height="10" rx="4" fill="#4a4a6a"/>
+    <!-- Line 2 — indented content -->
+    <rect x="36" y="66" width="56" height="10" rx="4" fill="#4a4a6a"/>
+    <!-- Line 3 — </div> closing tag, cursor inline -->
+    <rect x="22" y="84" width="36" height="10" rx="4" fill="#3a3a5a"/>
+  </g>
+
+  <!-- Cursor — inline with line 3 -->
+  <g filter="url(#cursorGlow)">
+    <rect x="62" y="82" width="3" height="14" rx="1.5" fill="url(#crimson)"/>
+  </g>
+
+  <!-- Document border -->
+  <rect x="14" y="18" width="100" height="92" rx="6" fill="none" stroke="#2a2a48" stroke-width="1"/>
+</svg>
