@@ -237,7 +237,7 @@ unsafe fn read_clipboard_text() -> Option<String> {
 /// # Safety
 /// Must be called from the main thread.
 pub unsafe fn show_window_now() {
-    logging::event("hotkey.show_window_now", "start");
+    logging::event("hotkey.show_window_now", "schedule");
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
     if ns_window.is_null() || visible_ptr.is_null() {
@@ -245,12 +245,76 @@ pub unsafe fn show_window_now() {
         return;
     }
 
-    let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
-    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+    schedule_show_window();
+}
 
+unsafe fn schedule_show_window() {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Sel};
+
+    let class_name = "ZeditorShowHelper";
+    let helper_class = if let Some(cls) = Class::get(class_name) {
+        cls
+    } else {
+        let Some(superclass) = Class::get("NSObject") else {
+            logging::event("hotkey.schedule_show_window", "missing_nsobject");
+            return;
+        };
+        let Some(mut decl) = ClassDecl::new(class_name, superclass) else {
+            logging::event("hotkey.schedule_show_window", "class_decl_failed");
+            return;
+        };
+
+        extern "C" fn do_show(_self: &Object, _cmd: Sel) {
+            let result = std::panic::catch_unwind(|| unsafe {
+                show_window_on_appkit_tick();
+            });
+            if let Err(e) = result {
+                logging::event("hotkey.show_window_now", format!("panic={:?}", e));
+            }
+        }
+
+        decl.add_method(sel!(doShow), do_show as extern "C" fn(&Object, Sel));
+        decl.register()
+    };
+
+    let helper: id = msg_send![helper_class, new];
+    let _: () = msg_send![
+        helper,
+        performSelector: sel!(doShow)
+        withObject: nil
+        afterDelay: 0.0f64
+    ];
+}
+
+unsafe fn show_window_on_appkit_tick() {
+    logging::event("hotkey.show_window_now", "start");
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+    if ns_window.is_null() || visible_ptr.is_null() {
+        logging::event(
+            "hotkey.show_window_now",
+            "missing_window_or_visible_on_tick",
+        );
+        return;
+    }
+
+    let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+    logging::event("hotkey.show_window_now", "activate_start");
+    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+    logging::event("hotkey.show_window_now", "activate_done");
+
+    logging::event("hotkey.show_window_now", "center_start");
     let _: () = msg_send![ns_window, center];
-    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+    logging::event("hotkey.show_window_now", "center_done");
+
+    logging::event("hotkey.show_window_now", "order_front_start");
     let _: () = msg_send![ns_window, orderFrontRegardless];
+    logging::event("hotkey.show_window_now", "order_front_done");
+
+    logging::event("hotkey.show_window_now", "make_key_start");
+    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+    logging::event("hotkey.show_window_now", "make_key_done");
 
     (*visible_ptr).store(true, Ordering::SeqCst);
     logging::event("hotkey.show_window_now", "visible");
