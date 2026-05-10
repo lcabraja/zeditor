@@ -1665,9 +1665,23 @@ impl EntityInputHandler for MultiLineEditor {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.marked_range.is_none() && self.cursors.len() > 1 {
+            logging::event(
+                "editor.replace_text_in_range",
+                format!(
+                    "multi_cursor_insert cursors={} text_bytes={} explicit_range={}",
+                    self.cursors.len(),
+                    new_text.len(),
+                    range_utf16.is_some()
+                ),
+            );
+            self.insert_text_at_cursors(new_text, window, cx);
+            return;
+        }
+
         let flat = self.flat_text();
         let range = range_utf16
             .as_ref()
