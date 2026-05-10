@@ -7,6 +7,7 @@ use objc2_app_kit::NSColor;
 
 #[allow(dead_code)]
 pub struct Theme {
+    pub mode: ThemeMode,
     pub text: Rgba,
     pub subtext1: Rgba,
     pub subtext0: Rgba,
@@ -25,6 +26,12 @@ pub struct Theme {
 }
 
 impl Global for Theme {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+}
 
 /// Get the system accent color on macOS
 #[cfg(target_os = "macos")]
@@ -56,8 +63,44 @@ fn get_system_accent_color() -> Rgba {
 
 impl Theme {
     pub fn init(app: &mut App) {
-        let theme = Theme::get_dark();
-        app.set_global(theme);
+        Self::set_for_appearance(app.window_appearance(), app);
+    }
+
+    pub fn set_for_appearance(appearance: WindowAppearance, app: &mut App) {
+        let mode = ThemeMode::from(appearance);
+        let current_mode = app.try_global::<Theme>().map(|theme| theme.mode);
+
+        if current_mode == Some(mode) {
+            return;
+        }
+
+        app.set_global(match mode {
+            ThemeMode::Light => Theme::get_light(),
+            ThemeMode::Dark => Theme::get_dark(),
+        });
+        app.refresh_windows();
+    }
+
+    // Catppuccin Latte
+    pub fn get_light() -> Theme {
+        Theme {
+            mode: ThemeMode::Light,
+            text: rgb(0x4c4f69),
+            subtext1: rgb(0x5c5f77),
+            subtext0: rgb(0x6c6f85),
+            overlay2: rgb(0x7c7f93),
+            overlay1: rgb(0x8c8fa1),
+            overlay0: rgb(0x9ca0b0),
+            surface2: rgb(0xacb0be),
+            surface1: rgb(0xbcc0cc),
+            surface0: rgb(0xccd0da),
+            base: rgb(0xeff1f5),
+            base_blur: rgba(0xeff1f5dd),
+            mantle: rgb(0xe6e9ef),
+            crust: rgb(0xdce0e8),
+            crust_light: rgba(0x9ca0b066),
+            accent: get_system_accent_color(),
+        }
     }
 
     // Catppuccin Mocha
@@ -75,6 +118,7 @@ impl Theme {
     // Crust	#11111b	rgb(17, 17, 27)	hsl(240, 23%, 9%)
     pub fn get_dark() -> Theme {
         Theme {
+            mode: ThemeMode::Dark,
             text: rgb(0xcdd6f4),
             subtext1: rgb(0xbac2de),
             subtext0: rgb(0xa6adc8),
@@ -90,6 +134,15 @@ impl Theme {
             crust: rgb(0x11111b),
             crust_light: rgba(0x6c708666),
             accent: get_system_accent_color(),
+        }
+    }
+}
+
+impl From<WindowAppearance> for ThemeMode {
+    fn from(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeMode::Light,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
         }
     }
 }

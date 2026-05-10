@@ -319,6 +319,7 @@ fn main() {
 
         let window_handle = cx
             .open_window(options, |window, cx| {
+                observe_system_theme(window);
                 cx.new(|cx| {
                     let popup = PopupEditor::new(cx);
                     // Focus the editor
@@ -415,7 +416,18 @@ fn open_preferences_window(cx: &mut App) {
         ..Default::default()
     };
 
-    let _ = cx.open_window(options, |_window, cx| cx.new(PreferencesWindow::new));
+    let _ = cx.open_window(options, |window, cx| {
+        observe_system_theme(window);
+        cx.new(PreferencesWindow::new)
+    });
+}
+
+fn observe_system_theme(window: &mut Window) {
+    window
+        .observe_window_appearance(|window, cx| {
+            Theme::set_for_appearance(window.appearance(), cx);
+        })
+        .detach();
 }
 
 #[cfg(target_os = "macos")]
