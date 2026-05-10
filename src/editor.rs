@@ -11,6 +11,7 @@ use crate::logging;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 const CURSOR_FADE_DURATION: Duration = Duration::from_millis(400);
 const CURSOR_ANIMATION_STEP: Duration = Duration::from_millis(16);
+const OPTION_DRAG_SELECTION_THRESHOLD: Pixels = px(6.);
 
 fn ease_in_out_cubic(t: f32) -> f32 {
     if t < 0.5 {
@@ -127,6 +128,7 @@ pub struct MultiLineEditor {
     pub preferred_col_x: Option<Pixels>,
     pub marked_range: Option<Range<usize>>,
     pub is_selecting: bool,
+    pub option_drag_anchor: Option<Point<Pixels>>,
     pub word_wrap: bool,
     // Layout cache for IME/mouse
     pub last_shaped_lines: Vec<ShapedLine>,
@@ -165,6 +167,7 @@ impl MultiLineEditor {
             preferred_col_x: None,
             marked_range: None,
             is_selecting: false,
+            option_drag_anchor: None,
             word_wrap: false,
             last_shaped_lines: Vec::new(),
             last_wrapped_lines: Vec::new(),
@@ -1312,23 +1315,70 @@ impl MultiLineEditor {
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
-        let pos = self.position_for_mouse(event.position);
-        if event.modifiers.shift {
+        if event.modifiers.alt {
+            self.option_drag_anchor = Some(event.position);
+            self.update_option_drag_cursors(event.position, event.position, cx);
+        } else if event.modifiers.shift {
+            self.option_drag_anchor = None;
+            let pos = self.position_for_mouse(event.position);
             self.select_primary_to(pos, cx);
         } else {
+            self.option_drag_anchor = None;
+            let pos = self.position_for_mouse(event.position);
             self.move_cursors_to(pos, cx);
         }
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.option_drag_anchor = None;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            let pos = self.position_for_mouse(event.position);
-            self.select_primary_to(pos, cx);
+            if let Some(anchor) = self.option_drag_anchor {
+                self.update_option_drag_cursors(anchor, event.position, cx);
+            } else {
+                let pos = self.position_for_mouse(event.position);
+                self.select_primary_to(pos, cx);
+            }
         }
+    }
+
+    fn update_option_drag_cursors(
+        &mut self,
+        anchor_point: Point<Pixels>,
+        current_point: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let anchor = self.position_for_mouse(anchor_point);
+        let current = self.position_for_mouse(current_point);
+        let start_line = anchor.line.min(current.line);
+        let end_line = anchor.line.max(current.line);
+        let has_horizontal_selection =
+            (current_point.x - anchor_point.x).abs() >= OPTION_DRAG_SELECTION_THRESHOLD;
+
+        let mut cursors = Vec::with_capacity(end_line - start_line + 1);
+        for line in start_line..=end_line {
+            let anchor_col = self.col_for_mouse_x_in_line(anchor_point.x, line);
+            let current_col = self.col_for_mouse_x_in_line(current_point.x, line);
+            if has_horizontal_selection && anchor_col != current_col {
+                cursors.push(Cursor {
+                    position: CursorPosition::new(line, current_col),
+                    anchor: Some(CursorPosition::new(line, anchor_col)),
+                });
+            } else {
+                cursors.push(Cursor::new(line, anchor_col));
+            }
+        }
+
+        self.cursors = cursors;
+        self.merge_overlapping_cursors();
+        self.marked_range = None;
+        self.preferred_col_x = None;
+        self.request_scroll_to_cursor();
+        self.reset_cursor_blink(cx);
+        cx.notify();
     }
 
     fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
@@ -1400,6 +1450,26 @@ impl MultiLineEditor {
             };
 
             CursorPosition::new(line, col)
+        }
+    }
+
+    fn col_for_mouse_x_in_line(&self, x: Pixels, line: usize) -> usize {
+        let line = line.min(self.lines.len().saturating_sub(1));
+        let Some(bounds) = &self.last_bounds else {
+            return 0;
+        };
+
+        let local_x = x - bounds.left() - self.last_gutter_width + self.scroll_offset.x;
+        if self.word_wrap {
+            self.last_wrapped_lines
+                .get(line)
+                .map(|wrapped| wrapped.unwrapped_layout.closest_index_for_x(local_x))
+                .unwrap_or(0)
+        } else {
+            self.last_shaped_lines
+                .get(line)
+                .map(|shaped| shaped.closest_index_for_x(local_x))
+                .unwrap_or(0)
         }
     }
 
