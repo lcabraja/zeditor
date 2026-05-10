@@ -6,8 +6,10 @@ use cocoa::foundation::NSString;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{CStr, c_void};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use crate::logging;
 
 // Carbon Event constants
 const K_VK_ESCAPE: u16 = 0x35; // Virtual key code for Escape
@@ -97,6 +99,7 @@ static GLOBAL_PREVIOUS_APP: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_MENU: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+static SUBMIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_CLIPBOARD: Mutex<Option<Option<String>>> = Mutex::new(None);
@@ -127,15 +130,18 @@ fn signal_request(update: impl FnOnce(&mut RequestState)) {
 }
 
 fn request_show_window() {
+    logging::event("hotkey.request", "show_window");
     signal_request(|state| state.show_window = true);
 }
 
 fn request_open_preferences() {
+    logging::event("hotkey.request", "open_preferences");
     signal_request(|state| state.open_preferences = true);
 }
 
 /// Wait until at least one UI request is pending, then drain the current batch.
 pub fn wait_for_requests() -> PendingRequests {
+    logging::event("hotkey.wait_for_requests", "waiting");
     let (lock, condvar) = request_state();
     let mut state = lock.lock().expect("request state lock poisoned");
     while !state.show_window && !state.open_preferences {
@@ -144,10 +150,18 @@ pub fn wait_for_requests() -> PendingRequests {
             .expect("request state lock poisoned while waiting");
     }
 
-    PendingRequests {
+    let requests = PendingRequests {
         show_window: std::mem::take(&mut state.show_window),
         open_preferences: std::mem::take(&mut state.open_preferences),
-    }
+    };
+    logging::event(
+        "hotkey.wait_for_requests",
+        format!(
+            "drained show_window={} open_preferences={}",
+            requests.show_window, requests.open_preferences
+        ),
+    );
+    requests
 }
 
 /// Get the current error message, if any.
@@ -183,23 +197,39 @@ pub fn set_initial_text(text: String) {
 }
 
 unsafe fn read_clipboard_text() -> Option<String> {
+    let started = std::time::Instant::now();
     let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
     if pasteboard.is_null() {
+        logging::event("hotkey.read_clipboard", "pasteboard_null");
         return None;
     }
 
     let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
     let ns_string: id = msg_send![pasteboard, stringForType: string_type];
     if ns_string.is_null() {
+        logging::event(
+            "hotkey.read_clipboard",
+            format!("no_string elapsed_ms={}", started.elapsed().as_millis()),
+        );
         return None;
     }
 
     let utf8: *const std::ffi::c_char = msg_send![ns_string, UTF8String];
     if utf8.is_null() {
+        logging::event("hotkey.read_clipboard", "utf8_null");
         return None;
     }
 
-    Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    let text = CStr::from_ptr(utf8).to_string_lossy().into_owned();
+    logging::event(
+        "hotkey.read_clipboard",
+        format!(
+            "ok bytes={} elapsed_ms={}",
+            text.len(),
+            started.elapsed().as_millis()
+        ),
+    );
+    Some(text)
 }
 
 /// Actually show the window. Called from the GPUI side after the editor text has been set.
@@ -207,9 +237,11 @@ unsafe fn read_clipboard_text() -> Option<String> {
 /// # Safety
 /// Must be called from the main thread.
 pub unsafe fn show_window_now() {
+    logging::event("hotkey.show_window_now", "start");
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
     if ns_window.is_null() || visible_ptr.is_null() {
+        logging::event("hotkey.show_window_now", "missing_window_or_visible");
         return;
     }
 
@@ -221,6 +253,7 @@ pub unsafe fn show_window_now() {
     let _: () = msg_send![ns_window, orderFrontRegardless];
 
     (*visible_ptr).store(true, Ordering::SeqCst);
+    logging::event("hotkey.show_window_now", "visible");
 }
 
 fn version_string() -> String {
@@ -242,6 +275,10 @@ fn version_string() -> String {
 /// # Safety
 /// `ns_window` must be a valid NSWindow/NSPanel pointer that outlives the monitors.
 pub unsafe fn register_hotkey(ns_window: *mut Object, key_code: u32, modifiers: u32) {
+    logging::event(
+        "hotkey.register",
+        format!("key_code={} modifiers={}", key_code, modifiers),
+    );
     // Check if we have accessibility permissions, prompt if not
     let trusted = AXIsProcessTrusted();
     if !trusted {
@@ -276,6 +313,10 @@ pub unsafe fn register_hotkey(ns_window: *mut Object, key_code: u32, modifiers: 
 /// # Safety
 /// Must be called from the main thread after `register_hotkey` has been called.
 pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
+    logging::event(
+        "hotkey.re_register",
+        format!("key_code={} modifiers={}", key_code, modifiers),
+    );
     // Unregister old hotkey
     let old_ref = GLOBAL_HOTKEY_REF.swap(0, Ordering::SeqCst) as EventHotKeyRef;
     if !old_ref.is_null() {
@@ -299,6 +340,7 @@ pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
     );
 
     if status != 0 {
+        logging::event("hotkey.re_register", format!("failed status={}", status));
         set_error(Some(format!(
             "Hotkey registration failed (status: {})",
             status
@@ -306,6 +348,7 @@ pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
     } else {
         GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
         set_error(None);
+        logging::event("hotkey.re_register", "ok");
     }
 }
 
@@ -338,12 +381,17 @@ unsafe fn register_carbon_hotkey(
     );
 
     if status != 0 {
+        logging::event(
+            "hotkey.register_carbon",
+            format!("failed status={}", status),
+        );
         set_error(Some(format!(
             "Hotkey registration failed (status: {})",
             status
         )));
     } else {
         GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
+        logging::event("hotkey.register_carbon", "ok");
     }
 
     // Install the event handler (only once)
@@ -365,6 +413,12 @@ unsafe fn register_carbon_hotkey(
 
         if status != 0 {
             eprintln!("InstallEventHandler failed with status: {}", status);
+            logging::event(
+                "hotkey.install_handler",
+                format!("failed status={}", status),
+            );
+        } else {
+            logging::event("hotkey.install_handler", "ok");
         }
     }
 }
@@ -417,6 +471,7 @@ extern "C" fn hotkey_handler(
         );
 
         if status == 0 && hotkey_id.id == 1 {
+            logging::event("hotkey.handler", "pressed");
             let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
             let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
             if !visible_ptr.is_null() && !ns_window.is_null() {
@@ -660,32 +715,43 @@ unsafe fn update_menu_error() {
 /// `ns_window` must be a valid NSWindow pointer.
 pub unsafe fn hide_window(ns_window: *mut Object, visible: &AtomicBool) {
     if !visible.load(Ordering::SeqCst) {
+        logging::event("hotkey.hide_window", "already_hidden");
         return;
     }
 
+    logging::event("hotkey.hide_window", "start");
     let _: () = msg_send![ns_window, orderOut: nil];
     visible.store(false, Ordering::SeqCst);
 
     let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
     if !prev_app.is_null() {
+        let prev_pid = running_app_pid(prev_app);
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
         let _: () = msg_send![prev_app, release];
+        logging::event(
+            "hotkey.hide_window",
+            format!("restored prev_pid={}", prev_pid),
+        );
     }
 }
 
 pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
     if visible.load(Ordering::SeqCst) {
+        logging::event("hotkey.toggle_window", "hide");
         hide_window(ns_window, visible);
     } else {
+        logging::event("hotkey.toggle_window", "show");
         // Remember the previous frontmost app for focus restoration on hide
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let frontmost_app: id = msg_send![workspace, frontmostApplication];
         if !frontmost_app.is_null() {
+            let pid = running_app_pid(frontmost_app);
             let _: id = msg_send![frontmost_app, retain];
             let old = GLOBAL_PREVIOUS_APP.swap(frontmost_app as usize, Ordering::SeqCst) as id;
             if !old.is_null() {
                 let _: () = msg_send![old, release];
             }
+            logging::event("hotkey.toggle_window", format!("stored_prev_pid={}", pid));
         }
 
         set_pending_clipboard(read_clipboard_text());
@@ -698,42 +764,100 @@ pub unsafe fn toggle_window(ns_window: *mut Object, visible: &AtomicBool) {
 ///
 /// # Safety
 /// Must be called from the main thread with a valid ns_window pointer.
-pub unsafe fn submit_and_paste(text: &str) {
+pub unsafe fn submit_and_paste(op_id: u64, text: &str) {
+    if SUBMIT_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        logging::event(
+            "hotkey.submit_and_paste",
+            format!("op_id={} ignored_already_in_progress", op_id),
+        );
+        return;
+    }
+
     let text = text.to_string();
-    let result = std::panic::catch_unwind(move || unsafe { submit_and_paste_inner(&text) });
+    let result = std::panic::catch_unwind(move || unsafe { submit_and_paste_inner(op_id, &text) });
     if let Err(e) = result {
         eprintln!("[submit_and_paste] Panic: {:?}", e);
+        logging::event(
+            "hotkey.submit_and_paste",
+            format!("op_id={} panic={:?}", op_id, e),
+        );
+        SUBMIT_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
 
 // Store app to release after paste
 static PENDING_RELEASE_APP: AtomicUsize = AtomicUsize::new(0);
+static PENDING_PASTE_OP_ID: AtomicU64 = AtomicU64::new(0);
+static PENDING_PASTE_TARGET_PID: AtomicI32 = AtomicI32::new(-1);
+static PENDING_PASTE_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
-unsafe fn submit_and_paste_inner(text: &str) {
+unsafe fn submit_and_paste_inner(op_id: u64, text: &str) {
+    let started = std::time::Instant::now();
+    logging::event(
+        "hotkey.submit_and_paste",
+        format!("op_id={} start text_bytes={}", op_id, text.len()),
+    );
+
     let pasteboard: id = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pasteboard.is_null() {
+        logging::event(
+            "hotkey.submit_and_paste",
+            format!("op_id={} pasteboard_null", op_id),
+        );
+        SUBMIT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        return;
+    }
+
     let _: () = msg_send![pasteboard, clearContents];
     let ns_string: id = NSString::alloc(nil).init_str(text);
     let string_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
-    let _: bool = msg_send![pasteboard, setString: ns_string forType: string_type];
+    let wrote: bool = msg_send![pasteboard, setString: ns_string forType: string_type];
+    logging::event(
+        "hotkey.submit_and_paste",
+        format!(
+            "op_id={} pasteboard_written={} elapsed_ms={}",
+            op_id,
+            wrote,
+            started.elapsed().as_millis()
+        ),
+    );
 
     let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
     let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
     let prev_app = GLOBAL_PREVIOUS_APP.swap(0, Ordering::SeqCst) as id;
+    let target_pid = running_app_pid(prev_app);
 
     if !ns_window.is_null() && !visible_ptr.is_null() {
         let _: () = msg_send![ns_window, orderOut: nil];
         (*visible_ptr).store(false, Ordering::SeqCst);
+        logging::event("hotkey.submit_and_paste", format!("op_id={} hidden", op_id));
     }
 
     if !prev_app.is_null() {
         let _: bool = msg_send![prev_app, activateWithOptions: 2u64];
         PENDING_RELEASE_APP.store(prev_app as usize, Ordering::SeqCst);
+        logging::event(
+            "hotkey.submit_and_paste",
+            format!("op_id={} activating_prev_pid={}", op_id, target_pid),
+        );
+    } else {
+        logging::event(
+            "hotkey.submit_and_paste",
+            format!("op_id={} no_previous_app", op_id),
+        );
     }
 
-    schedule_paste_with_delay();
+    schedule_paste_with_delay(op_id, target_pid);
 }
 
-unsafe fn schedule_paste_with_delay() {
+unsafe fn schedule_paste_with_delay(op_id: u64, target_pid: i32) {
+    PENDING_PASTE_OP_ID.store(op_id, Ordering::SeqCst);
+    PENDING_PASTE_TARGET_PID.store(target_pid, Ordering::SeqCst);
+    PENDING_PASTE_STARTED_AT_MS.store(logging::unix_millis(), Ordering::SeqCst);
+    schedule_paste_timer(0.025);
+}
+
+unsafe fn schedule_paste_timer(delay_seconds: f64) {
     use objc::declare::ClassDecl;
     use objc::runtime::{Class, Sel};
 
@@ -752,15 +876,44 @@ unsafe fn schedule_paste_with_delay() {
 
         extern "C" fn do_paste(_self: &Object, _cmd: Sel) {
             let result = std::panic::catch_unwind(|| unsafe {
-                simulate_paste();
+                let op_id = PENDING_PASTE_OP_ID.load(Ordering::SeqCst);
+                let target_pid = PENDING_PASTE_TARGET_PID.load(Ordering::SeqCst);
+                let started_at = PENDING_PASTE_STARTED_AT_MS.load(Ordering::SeqCst);
+                let elapsed_ms = logging::unix_millis().saturating_sub(started_at);
+                let frontmost_pid = frontmost_app_pid();
+
+                if target_pid > 0 && frontmost_pid != target_pid && elapsed_ms < 1_000 {
+                    logging::event(
+                        "hotkey.do_paste",
+                        format!(
+                            "op_id={} waiting_for_activation target_pid={} frontmost_pid={} elapsed_ms={}",
+                            op_id, target_pid, frontmost_pid, elapsed_ms
+                        ),
+                    );
+                    schedule_paste_timer(0.025);
+                    return;
+                }
+
+                logging::event(
+                    "hotkey.do_paste",
+                    format!(
+                        "op_id={} paste_now target_pid={} frontmost_pid={} elapsed_ms={}",
+                        op_id, target_pid, frontmost_pid, elapsed_ms
+                    ),
+                );
+                simulate_paste(op_id);
 
                 let prev_app = PENDING_RELEASE_APP.swap(0, Ordering::SeqCst) as id;
                 if !prev_app.is_null() {
                     let _: () = msg_send![prev_app, release];
                 }
+                SUBMIT_IN_PROGRESS.store(false, Ordering::SeqCst);
+                logging::event("hotkey.do_paste", format!("op_id={} complete", op_id));
             });
             if let Err(e) = result {
                 eprintln!("[do_paste] Panic: {:?}", e);
+                logging::event("hotkey.do_paste", format!("panic={:?}", e));
+                SUBMIT_IN_PROGRESS.store(false, Ordering::SeqCst);
             }
         }
 
@@ -774,11 +927,11 @@ unsafe fn schedule_paste_with_delay() {
         helper,
         performSelector: sel!(doPaste)
         withObject: nil
-        afterDelay: 0.05f64
+        afterDelay: delay_seconds
     ];
 }
 
-unsafe fn simulate_paste() {
+unsafe fn simulate_paste(op_id: u64) {
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
@@ -799,6 +952,10 @@ unsafe fn simulate_paste() {
 
     let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE);
     if source.is_null() {
+        logging::event(
+            "hotkey.simulate_paste",
+            format!("op_id={} source_null", op_id),
+        );
         return;
     }
 
@@ -807,6 +964,11 @@ unsafe fn simulate_paste() {
         CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
         CGEventPost(K_CG_HID_EVENT_TAP, key_down);
         CFRelease(key_down);
+    } else {
+        logging::event(
+            "hotkey.simulate_paste",
+            format!("op_id={} key_down_null", op_id),
+        );
     }
 
     let key_up = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false);
@@ -814,7 +976,29 @@ unsafe fn simulate_paste() {
         CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
         CGEventPost(K_CG_HID_EVENT_TAP, key_up);
         CFRelease(key_up);
+    } else {
+        logging::event(
+            "hotkey.simulate_paste",
+            format!("op_id={} key_up_null", op_id),
+        );
     }
 
     CFRelease(source);
+    logging::event("hotkey.simulate_paste", format!("op_id={} posted", op_id));
+}
+
+unsafe fn running_app_pid(app: id) -> i32 {
+    if app.is_null() {
+        return -1;
+    }
+    msg_send![app, processIdentifier]
+}
+
+unsafe fn frontmost_app_pid() -> i32 {
+    let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+    if workspace.is_null() {
+        return -1;
+    }
+    let frontmost_app: id = msg_send![workspace, frontmostApplication];
+    running_app_pid(frontmost_app)
 }

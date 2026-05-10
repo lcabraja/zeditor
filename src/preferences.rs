@@ -2,6 +2,9 @@ use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const OLD_DEFAULT_KEY_CODE: u32 = 0x0E; // 'E'
+const OLD_DEFAULT_MODIFIERS: u32 = (1 << 8) | (1 << 9); // Cmd + Shift
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HotkeyConfig {
     pub key_code: u32,
@@ -12,9 +15,9 @@ pub struct HotkeyConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key_code: 0x0E,                 // 'E'
-            modifiers: (1 << 8) | (1 << 9), // Cmd + Shift
-            display_string: "Cmd+Shift+E".to_string(),
+            key_code: 0x09,                  // 'V'
+            modifiers: (1 << 8) | (1 << 11), // Cmd + Option
+            display_string: "Option+Cmd+V".to_string(),
         }
     }
 }
@@ -35,11 +38,20 @@ fn config_path() -> PathBuf {
 
 pub fn load_preferences() -> Preferences {
     let path = config_path();
-    if let Ok(data) = std::fs::read_to_string(&path) {
+    let mut prefs = if let Ok(data) = std::fs::read_to_string(&path) {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         Preferences::default()
+    };
+
+    let migrated_old_default = prefs.hotkey.key_code == OLD_DEFAULT_KEY_CODE
+        && prefs.hotkey.modifiers == OLD_DEFAULT_MODIFIERS;
+    if migrated_old_default {
+        prefs.hotkey = HotkeyConfig::default();
+        save_preferences(&prefs);
     }
+
+    prefs
 }
 
 pub fn save_preferences(prefs: &Preferences) {

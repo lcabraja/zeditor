@@ -2,6 +2,7 @@ mod assets;
 mod editor;
 #[cfg(target_os = "macos")]
 mod hotkey;
+mod logging;
 mod preferences;
 mod preferences_window;
 mod theme;
@@ -98,9 +99,23 @@ impl PopupEditor {
         cx: &mut Context<Self>,
     ) {
         let text = self.editor.read(cx).get_submit_text();
+        let op_id = logging::next_operation_id();
+        logging::event(
+            "popup.submit_and_paste",
+            format!(
+                "op_id={} start text_bytes={} text_lines={}",
+                op_id,
+                text.len(),
+                text.lines().count()
+            ),
+        );
         unsafe {
-            hotkey::submit_and_paste(&text);
+            hotkey::submit_and_paste(op_id, &text);
         }
+        logging::event(
+            "popup.submit_and_paste",
+            format!("op_id={} submitted_to_hotkey", op_id),
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -308,7 +323,7 @@ fn main() {
                     let popup = PopupEditor::new(cx);
                     // Focus the editor
                     let focus = popup.editor.read(cx).focus_handle.clone();
-                    window.focus(&focus, cx);
+                    window.focus(&focus);
                     popup
                 })
             })
@@ -358,11 +373,11 @@ fn main() {
                 loop {
                     let requests = cx
                         .background_executor()
-                        .await_on_background(async { hotkey::wait_for_requests() })
+                        .spawn(async { hotkey::wait_for_requests() })
                         .await;
 
                     if requests.open_preferences {
-                        cx.update(|cx| {
+                        let _ = cx.update(|cx| {
                             open_preferences_window(cx);
                         });
                     }

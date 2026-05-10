@@ -13,7 +13,7 @@ name = "zeditor"
 
 [dependencies]
 anyhow = "1"
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui = "0.2"
 rust-embed = "8"
 unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }

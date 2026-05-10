@@ -6,6 +6,7 @@ use gpui::*;
 use unicode_segmentation::*;
 
 use crate::Theme;
+use crate::logging;
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 const CURSOR_FADE_DURATION: Duration = Duration::from_millis(400);
@@ -903,8 +904,37 @@ impl MultiLineEditor {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let op_id = logging::next_operation_id();
+        let started = Instant::now();
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            logging::event(
+                "editor.paste",
+                format!(
+                    "op_id={} clipboard_read bytes={} lines={} elapsed_ms={}",
+                    op_id,
+                    text.len(),
+                    text.lines().count(),
+                    started.elapsed().as_millis()
+                ),
+            );
             self.insert_text_at_cursors(&text, window, cx);
+            logging::event(
+                "editor.paste",
+                format!(
+                    "op_id={} complete total_elapsed_ms={}",
+                    op_id,
+                    started.elapsed().as_millis()
+                ),
+            );
+        } else {
+            logging::event(
+                "editor.paste",
+                format!(
+                    "op_id={} clipboard_empty elapsed_ms={}",
+                    op_id,
+                    started.elapsed().as_millis()
+                ),
+            );
         }
     }
 
@@ -1120,6 +1150,22 @@ impl MultiLineEditor {
     // --- Multi-cursor edit ---
 
     fn insert_text_at_cursors(&mut self, text: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        let op_id = logging::next_operation_id();
+        let started = Instant::now();
+        let original_line_count = self.lines.len();
+        let original_cursor_count = self.cursors.len();
+        logging::event(
+            "editor.insert_text_at_cursors",
+            format!(
+                "op_id={} start text_bytes={} text_lines={} cursors={} lines={}",
+                op_id,
+                text.len(),
+                text.lines().count(),
+                original_cursor_count,
+                original_line_count
+            ),
+        );
+
         // Sort cursors in reverse document order (bottom-first)
         let mut indexed: Vec<(usize, Cursor)> = self.cursors.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.position.cmp(&a.1.position));
@@ -1156,6 +1202,17 @@ impl MultiLineEditor {
         self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
+        logging::event(
+            "editor.insert_text_at_cursors",
+            format!(
+                "op_id={} complete elapsed_ms={} lines_before={} lines_after={} chars={}",
+                op_id,
+                started.elapsed().as_millis(),
+                original_line_count,
+                self.lines.len(),
+                self.total_chars
+            ),
+        );
     }
 
     fn edit_with_cursors<F>(
@@ -1205,10 +1262,7 @@ impl MultiLineEditor {
                 &self.lines[start.line][..start.col],
                 &self.lines[end.line][end.col..]
             );
-            // Remove lines from start.line+1 to end.line (inclusive)
-            for _ in start.line + 1..=end.line {
-                self.lines.remove(start.line + 1);
-            }
+            self.lines.drain(start.line + 1..=end.line);
             self.lines[start.line] = new_line;
         }
 
@@ -1233,15 +1287,16 @@ impl MultiLineEditor {
         let after_cursor = self.lines[pos.line][pos.col..].to_string();
         self.lines[pos.line] = format!("{}{}", &self.lines[pos.line][..pos.col], insert_lines[0]);
 
+        let mut inserted_lines = Vec::with_capacity(insert_lines.len().saturating_sub(1));
         for (i, segment) in insert_lines[1..].iter().enumerate() {
+            let mut line = (*segment).to_string();
             if i == insert_lines.len() - 2 {
-                // Last segment — append the text that was after the cursor
-                self.lines
-                    .insert(pos.line + 1 + i, format!("{}{}", segment, after_cursor));
-            } else {
-                self.lines.insert(pos.line + 1 + i, segment.to_string());
+                line.push_str(&after_cursor);
             }
+            inserted_lines.push(line);
         }
+        self.lines
+            .splice(pos.line + 1..pos.line + 1, inserted_lines);
 
         let new_line = pos.line + insert_lines.len() - 1;
         let new_col = insert_lines.last().unwrap().len();
@@ -2365,9 +2420,7 @@ impl Element for MultiLineTextElement {
                             continue;
                         }
                         let origin = point(content_left - scroll_offset.x, y);
-                        shaped
-                            .paint(origin, line_height, TextAlign::Left, None, window, cx)
-                            .ok();
+                        shaped.paint(origin, line_height, window, cx).ok();
                     }
                 }
 
@@ -2410,9 +2463,7 @@ impl Element for MultiLineTextElement {
         for (shaped_num, y) in &prepaint.gutter_line_numbers {
             let num_x = bounds.left() + gutter_width - px(16.) - shaped_num.width;
             let origin = point(num_x, bounds.top() + *y);
-            shaped_num
-                .paint(origin, line_height, TextAlign::Left, None, window, cx)
-                .ok();
+            shaped_num.paint(origin, line_height, window, cx).ok();
         }
 
         // Update cached layout info

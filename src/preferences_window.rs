@@ -124,7 +124,7 @@ impl PreferencesWindow {
             display.push_str("Ctrl+");
         }
         if keystroke.modifiers.alt {
-            display.push_str("Alt+");
+            display.push_str("Option+");
         }
         if keystroke.modifiers.shift {
             display.push_str("Shift+");
@@ -275,7 +275,7 @@ impl Render for PreferencesWindow {
                                     .text_size(px(11.))
                                     .text_color(theme.overlay0)
                                     .child(if recording {
-                                        "Press a key combination with at least one modifier (Cmd, Alt, Ctrl)"
+                                        "Press a key combination with at least one modifier (Cmd, Option, Ctrl)"
                                     } else if has_recorded {
                                         "New hotkey recorded. Save to apply."
                                     } else {
