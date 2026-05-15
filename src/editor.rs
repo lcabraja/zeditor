@@ -367,6 +367,15 @@ impl MultiLineEditor {
         cx.notify();
     }
 
+    fn add_cursor_at(&mut self, pos: CursorPosition, cx: &mut Context<Self>) {
+        let pos = self.clamp_position(&pos);
+        self.cursors.push(Cursor::new(pos.line, pos.col));
+        self.merge_overlapping_cursors();
+        self.preferred_col_x = None;
+        self.reset_cursor_blink(cx);
+        cx.notify();
+    }
+
     fn select_primary_to(&mut self, pos: CursorPosition, cx: &mut Context<Self>) {
         let pos = self.clamp_position(&pos);
         let c = &mut self.cursors[0];
@@ -955,7 +964,33 @@ impl MultiLineEditor {
             let text = self.text_in_range(&start, &end);
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.insert_text_at_cursors("", window, cx);
+        } else {
+            self.cut_current_line(cx);
         }
+    }
+
+    fn cut_current_line(&mut self, cx: &mut Context<Self>) {
+        let line = self.cursors[0].position.line.min(self.lines.len().saturating_sub(1));
+        let text = format!("{}\n", self.lines[line]);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+
+        if self.lines.len() == 1 {
+            self.lines[0].clear();
+            self.cursors = vec![Cursor::new(0, 0)];
+        } else {
+            self.lines.remove(line);
+            let cursor_line = line.min(self.lines.len().saturating_sub(1));
+            self.cursors = vec![Cursor::new(cursor_line, 0)];
+        }
+
+        self.merge_overlapping_cursors();
+        self.marked_range = None;
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
+        self.preferred_col_x = None;
+        self.request_scroll_to_cursor();
+        self.reset_cursor_blink(cx);
+        cx.notify();
     }
 
     /// Get the text to submit/paste.
@@ -1317,7 +1352,8 @@ impl MultiLineEditor {
         self.is_selecting = true;
         if event.modifiers.alt {
             self.option_drag_anchor = Some(event.position);
-            self.update_option_drag_cursors(event.position, event.position, cx);
+            let pos = self.position_for_mouse(event.position);
+            self.add_cursor_at(pos, cx);
         } else if event.modifiers.shift {
             self.option_drag_anchor = None;
             let pos = self.position_for_mouse(event.position);

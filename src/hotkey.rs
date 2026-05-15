@@ -312,12 +312,88 @@ unsafe fn show_window_on_appkit_tick() {
     let _: () = msg_send![ns_window, orderFrontRegardless];
     logging::event("hotkey.show_window_now", "order_front_done");
 
-    logging::event("hotkey.show_window_now", "make_key_start");
-    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
-    logging::event("hotkey.show_window_now", "make_key_done");
-
     (*visible_ptr).store(true, Ordering::SeqCst);
     logging::event("hotkey.show_window_now", "visible");
+
+    schedule_focus_window();
+}
+
+unsafe fn schedule_focus_window() {
+    PENDING_FOCUS_STARTED_AT_MS.store(logging::unix_millis(), Ordering::SeqCst);
+    schedule_focus_window_timer(0.025);
+}
+
+unsafe fn schedule_focus_window_timer(delay_seconds: f64) {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Sel};
+
+    let class_name = "ZeditorFocusHelper";
+    let helper_class = if let Some(cls) = Class::get(class_name) {
+        cls
+    } else {
+        let Some(superclass) = Class::get("NSObject") else {
+            logging::event("hotkey.schedule_focus_window", "missing_nsobject");
+            return;
+        };
+        let Some(mut decl) = ClassDecl::new(class_name, superclass) else {
+            logging::event("hotkey.schedule_focus_window", "class_decl_failed");
+            return;
+        };
+
+        extern "C" fn do_focus(_self: &Object, _cmd: Sel) {
+            let result = std::panic::catch_unwind(|| unsafe {
+                focus_window_when_app_active();
+            });
+            if let Err(e) = result {
+                logging::event("hotkey.focus_window", format!("panic={:?}", e));
+            }
+        }
+
+        decl.add_method(sel!(doFocus), do_focus as extern "C" fn(&Object, Sel));
+        decl.register()
+    };
+
+    let helper: id = msg_send![helper_class, new];
+    let _: () = msg_send![
+        helper,
+        performSelector: sel!(doFocus)
+        withObject: nil
+        afterDelay: delay_seconds
+    ];
+}
+
+unsafe fn focus_window_when_app_active() {
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    if ns_window.is_null() {
+        logging::event("hotkey.focus_window", "missing_window");
+        return;
+    }
+
+    let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
+    let is_active: bool = msg_send![ns_app, isActive];
+    let elapsed_ms =
+        logging::unix_millis().saturating_sub(PENDING_FOCUS_STARTED_AT_MS.load(Ordering::SeqCst));
+
+    if !is_active && elapsed_ms < 1_000 {
+        logging::event(
+            "hotkey.focus_window",
+            format!("waiting_for_activation elapsed_ms={}", elapsed_ms),
+        );
+        schedule_focus_window_timer(0.025);
+        return;
+    }
+
+    if !is_active {
+        logging::event(
+            "hotkey.focus_window",
+            format!("activation_timeout elapsed_ms={}", elapsed_ms),
+        );
+        return;
+    }
+
+    logging::event("hotkey.focus_window", "make_key_start");
+    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+    logging::event("hotkey.focus_window", "make_key_done");
 }
 
 fn version_string() -> String {
@@ -854,6 +930,7 @@ static PENDING_RELEASE_APP: AtomicUsize = AtomicUsize::new(0);
 static PENDING_PASTE_OP_ID: AtomicU64 = AtomicU64::new(0);
 static PENDING_PASTE_TARGET_PID: AtomicI32 = AtomicI32::new(-1);
 static PENDING_PASTE_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static PENDING_FOCUS_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn submit_and_paste_inner(op_id: u64, text: &str) {
     let started = std::time::Instant::now();
