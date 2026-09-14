@@ -3841,6 +3841,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "tempfile",
  "unicode-segmentation",
 ]
 

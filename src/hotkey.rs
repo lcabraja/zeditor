@@ -12,12 +12,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use crate::logging;
 
 // Carbon Event constants
-const K_VK_ESCAPE: u16 = 0x35; // Virtual key code for Escape
 const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962; // 'keyb'
 const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
 const K_EVENT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D2D2D; // '----'
 const TYPE_EVENT_HOT_KEY_ID: u32 = 0x686B6964; // 'hkid'
-const NS_KEY_DOWN_MASK: u64 = 1 << 10; // NSEventMaskKeyDown
 
 // NSWindowAnimationBehavior values
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
@@ -97,6 +95,7 @@ static GLOBAL_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_VISIBLE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_PREVIOUS_APP: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_HOTKEY_COMBO: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MENU: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static SUBMIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -440,27 +439,31 @@ pub unsafe fn register_hotkey(ns_window: *mut Object, key_code: u32, modifiers: 
     // Register Carbon global hotkey
     register_carbon_hotkey(ns_window, visible.clone(), key_code, modifiers);
 
-    // Register local ESC key monitor to hide window
-    register_escape_monitor(ns_window, visible.clone());
-
     // Register for app deactivation to auto-hide window
     register_deactivation_observer(ns_window, visible);
 }
 
-/// Re-registers the global hotkey with new key code and modifiers.
-/// Call this after the user changes the hotkey in preferences.
+/// Reserve the replacement, persist preferences, then release the old shortcut.
+/// Registration or persistence failure leaves the existing shortcut active.
 ///
 /// # Safety
 /// Must be called from the main thread after `register_hotkey` has been called.
-pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
+pub unsafe fn re_register_hotkey(
+    key_code: u32,
+    modifiers: u32,
+    persist: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     logging::event(
         "hotkey.re_register",
         format!("key_code={} modifiers={}", key_code, modifiers),
     );
-    // Unregister old hotkey
-    let old_ref = GLOBAL_HOTKEY_REF.swap(0, Ordering::SeqCst) as EventHotKeyRef;
-    if !old_ref.is_null() {
-        UnregisterEventHotKey(old_ref);
+    let combo = (u64::from(key_code) << 32) | u64::from(modifiers);
+    if GLOBAL_HOTKEY_REF.load(Ordering::SeqCst) != 0
+        && GLOBAL_HOTKEY_COMBO.load(Ordering::SeqCst) == combo
+    {
+        persist()?;
+        set_error(None);
+        return Ok(());
     }
 
     // Register new hotkey
@@ -481,14 +484,31 @@ pub unsafe fn re_register_hotkey(key_code: u32, modifiers: u32) {
 
     if status != 0 {
         logging::event("hotkey.re_register", format!("failed status={}", status));
-        set_error(Some(format!(
-            "Hotkey registration failed (status: {})",
-            status
-        )));
-    } else {
-        GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
-        set_error(None);
-        logging::event("hotkey.re_register", "ok");
+        anyhow::bail!(
+            "Cannot register this shortcut (status: {status}). Choose another combination."
+        );
+    }
+
+    let replacement = PendingHotkey(hotkey_ref);
+    persist()?;
+    let old_ref =
+        GLOBAL_HOTKEY_REF.swap(replacement.0 as usize, Ordering::SeqCst) as EventHotKeyRef;
+    GLOBAL_HOTKEY_COMBO.store(combo, Ordering::SeqCst);
+    std::mem::forget(replacement);
+    if !old_ref.is_null() {
+        UnregisterEventHotKey(old_ref);
+    }
+    set_error(None);
+    logging::event("hotkey.re_register", "ok");
+    Ok(())
+}
+
+/// Release a reserved shortcut if saving preferences fails or unwinds.
+struct PendingHotkey(EventHotKeyRef);
+
+impl Drop for PendingHotkey {
+    fn drop(&mut self) {
+        unsafe { UnregisterEventHotKey(self.0) };
     }
 }
 
@@ -531,6 +551,10 @@ unsafe fn register_carbon_hotkey(
         )));
     } else {
         GLOBAL_HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
+        GLOBAL_HOTKEY_COMBO.store(
+            (u64::from(key_code) << 32) | u64::from(modifiers),
+            Ordering::SeqCst,
+        );
         logging::event("hotkey.register_carbon", "ok");
     }
 
@@ -561,33 +585,6 @@ unsafe fn register_carbon_hotkey(
             logging::event("hotkey.install_handler", "ok");
         }
     }
-}
-
-unsafe fn register_escape_monitor(ns_window: *mut Object, visible: Arc<AtomicBool>) {
-    let ns_window = ns_window as usize;
-
-    let handler = block::ConcreteBlock::new(move |event: id| -> id {
-        unsafe {
-            let key_code: u16 = msg_send![event, keyCode];
-            if key_code == K_VK_ESCAPE && visible.load(Ordering::SeqCst) {
-                let ns_window = ns_window as *mut Object;
-                let visible_ptr = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
-                if !visible_ptr.is_null() {
-                    hide_window(ns_window, &*visible_ptr);
-                }
-                return nil;
-            }
-            event
-        }
-    });
-    let handler = handler.copy();
-
-    let _: id = msg_send![
-        class!(NSEvent),
-        addLocalMonitorForEventsMatchingMask: NS_KEY_DOWN_MASK
-        handler: &*handler
-    ];
-    std::mem::forget(handler);
 }
 
 extern "C" fn hotkey_handler(
@@ -846,6 +843,18 @@ unsafe fn update_menu_error() {
     } else {
         let _: () = msg_send![error_item, setHidden: true];
         let _: () = msg_send![error_sep, setHidden: true];
+    }
+}
+
+/// Hide the registered popup through the same path as the global toggle.
+///
+/// # Safety
+/// Must be called from the main thread after `register_hotkey`.
+pub unsafe fn hide_popup_window() {
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    let visible = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+    if !ns_window.is_null() && !visible.is_null() {
+        hide_window(ns_window, &*visible);
     }
 }
 

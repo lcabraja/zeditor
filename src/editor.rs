@@ -2587,8 +2587,8 @@ impl Element for MultiLineTextElement {
         }
 
         // Update cached layout info
-        let shaped_lines: Vec<ShapedLine> = prepaint.shaped_lines.drain(..).collect();
-        let wrapped_lines: Vec<WrappedLine> = prepaint.wrapped_lines.drain(..).collect();
+        let shaped_lines = std::mem::take(&mut prepaint.shaped_lines);
+        let wrapped_lines = std::mem::take(&mut prepaint.wrapped_lines);
         let visual_line_counts = prepaint.visual_line_counts.clone();
         let max_line_width = prepaint.max_line_width;
         let font_size = prepaint.font_size;

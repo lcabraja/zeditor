@@ -15,8 +15,6 @@ use preferences_window::*;
 use theme::*;
 
 #[cfg(target_os = "macos")]
-use objc::{msg_send, sel, sel_impl};
-#[cfg(target_os = "macos")]
 use raw_window_handle::HasWindowHandle;
 
 actions!(
@@ -431,17 +429,8 @@ fn observe_system_theme(window: &mut Window) {
 }
 
 #[cfg(target_os = "macos")]
-fn hide_window(window: &mut Window) {
-    if let Ok(handle) = window.window_handle() {
-        let raw = handle.as_raw();
-        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw {
-            let ns_view = appkit.ns_view.as_ptr() as *mut objc::runtime::Object;
-            unsafe {
-                let ns_window: *mut objc::runtime::Object = msg_send![ns_view, window];
-                let _: () = msg_send![ns_window, orderOut: cocoa::base::nil];
-            }
-        }
-    }
+fn hide_window(_window: &mut Window) {
+    unsafe { hotkey::hide_popup_window() };
 }
 
 #[cfg(not(target_os = "macos"))]

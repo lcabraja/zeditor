@@ -19,6 +19,7 @@ pub struct PreferencesWindow {
     recorded_key_code: Option<u32>,
     recorded_modifiers: u32,
     recorded_display: String,
+    save_error: Option<String>,
 }
 
 impl PreferencesWindow {
@@ -31,6 +32,7 @@ impl PreferencesWindow {
             recorded_key_code: None,
             recorded_modifiers: 0,
             recorded_display: String::new(),
+            save_error: None,
         }
     }
 
@@ -44,17 +46,11 @@ impl PreferencesWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.recording {
-            self.recording = false;
-            self.recorded_key_code = None;
-            self.recorded_modifiers = 0;
-            self.recorded_display.clear();
-        } else {
-            self.recording = true;
-            self.recorded_key_code = None;
-            self.recorded_modifiers = 0;
-            self.recorded_display.clear();
-        }
+        self.recording = !self.recording;
+        self.recorded_key_code = None;
+        self.recorded_modifiers = 0;
+        self.recorded_display.clear();
+        self.save_error = None;
         cx.notify();
     }
 
@@ -73,14 +69,21 @@ impl PreferencesWindow {
 
         let mut prefs = cx.global::<Preferences>().clone();
         prefs.hotkey = new_config.clone();
-        cx.set_global(prefs.clone());
-        save_preferences(&prefs);
-
         #[cfg(target_os = "macos")]
-        unsafe {
-            hotkey::re_register_hotkey(key_code, modifiers);
+        let result =
+            unsafe { hotkey::re_register_hotkey(key_code, modifiers, || save_preferences(&prefs)) };
+        #[cfg(not(target_os = "macos"))]
+        let result = save_preferences(&prefs);
+
+        if let Err(error) = result {
+            crate::logging::event("preferences.save", format!("{error:#}"));
+            self.save_error = Some(format!("Could not save shortcut: {error:#}"));
+            cx.notify();
+            return;
         }
 
+        cx.set_global(prefs);
+        self.save_error = None;
         self.current_hotkey = new_config;
         self.recording = false;
         self.recorded_key_code = None;
@@ -93,7 +96,6 @@ impl PreferencesWindow {
         if !self.recording {
             return;
         }
-
         let keystroke = &event.keystroke;
 
         if !keystroke.modifiers.platform && !keystroke.modifiers.alt && !keystroke.modifiers.control
@@ -284,7 +286,7 @@ impl Render for PreferencesWindow {
                             ),
                     )
                     // Error display
-                    .when_some(get_hotkey_error(), |el, err| {
+                    .when_some(self.save_error.clone().or_else(get_hotkey_error), |el, err| {
                         el.child(
                             div()
                                 .flex()
