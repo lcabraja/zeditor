@@ -57,15 +57,22 @@ active. Preference files are replaced atomically to avoid partial JSON writes.
 
 With the popup focused, press Cmd+Shift+V or click History in the header.
 Type to search the full retained history, use Up/Down to choose a clip, then
-press Enter or click it to insert its text at the editor's cursors. Selected
+press Enter or double-click it to insert its text at the editor's cursors. Selected
 text is replaced. Multi-cursor insertion follows the same rules as Cmd+V.
 Edit the inserted text, then press Cmd+Enter to paste into the previous app.
 Escape cancels the picker and restores the existing editor state.
 
+The left pane shows source-app icons and a full-width selection. Single-click
+to preview an item in the right pane. Search matches are highlighted in the
+list and full-text preview. Cmd+1 through Cmd+9 insert the corresponding visible
+row; the selected editable row shows a Return indicator. Word count, character
+count, and the copy time appear below the preview. The search field has no line
+number gutter.
+
 The picker reads Alfred's local clipboard database without modifying it or
 changing the system clipboard. File entries insert their full paths, one per
-line. Images appear in the list but cannot be inserted
-into the text editor. The database format is internal to Alfred and may change
+line. Images can be previewed but cannot be inserted into the text editor.
+The database format is internal to Alfred and may change
 in future versions. Missing history or read errors appear inside the picker.
 
 Intercepting Alfred's global Cmd+Shift+V shortcut requires Zeditor's existing

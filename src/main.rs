@@ -3,6 +3,7 @@ mod clipboard_history;
 mod editor;
 #[cfg(target_os = "macos")]
 mod history_hotkey;
+mod history_platform;
 #[cfg(target_os = "macos")]
 mod hotkey;
 mod logging;
@@ -218,7 +219,7 @@ impl Render for PopupEditor {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
+                    .relative()
                     .w_full()
                     .h(px(32.))
                     .px(px(12.))
@@ -226,23 +227,40 @@ impl Render for PopupEditor {
                     .border_color(theme.surface0)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .text_size(px(13.))
                             .text_color(theme.subtext0)
                             .child("Zeditor"),
                     )
                     .child(
                         div()
-                            .id("clipboard-history-button")
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .text_color(theme.subtext0)
-                            .child("History ⌘⇧V")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_clipboard_history(&OpenClipboardHistory, window, cx);
-                            })),
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .id("clipboard-history-button")
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(theme.subtext0)
+                                    .child("History ⌘⇧V")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_clipboard_history(
+                                            &OpenClipboardHistory,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_align(TextAlign::Right)
                             .text_size(px(11.))
                             .text_color(theme.overlay0)
                             .child(self.editor.read(cx).status_text()),

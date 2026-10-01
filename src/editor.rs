@@ -206,6 +206,7 @@ pub struct MultiLineEditor {
     pub is_selecting: bool,
     pub option_drag_anchor: Option<Point<Pixels>>,
     pub word_wrap: bool,
+    pub compact_input: bool,
     // Layout cache for IME/mouse
     pub last_shaped_lines: Vec<ShapedLine>,
     pub last_wrapped_lines: Vec<WrappedLine>,
@@ -245,6 +246,7 @@ impl MultiLineEditor {
             is_selecting: false,
             option_drag_anchor: None,
             word_wrap: false,
+            compact_input: false,
             last_shaped_lines: Vec::new(),
             last_wrapped_lines: Vec::new(),
             last_bounds: None,
@@ -2262,7 +2264,11 @@ impl Render for MultiLineEditor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
-            .bg(theme.surface0)
+            .bg(if self.compact_input {
+                theme.base
+            } else {
+                theme.surface0
+            })
             .size_full()
             .overflow_hidden()
             .font_family("JetBrains Mono")
@@ -2372,7 +2378,11 @@ impl Element for MultiLineTextElement {
                 .text_system()
                 .shape_line(sample_text, font_size, &[gutter_run], None);
         let gutter_padding = px(16.); // padding after line numbers
-        let gutter_width = sample_shaped.width + gutter_padding;
+        let gutter_width = if self.input.read(cx).compact_input {
+            px(0.)
+        } else {
+            sample_shaped.width + gutter_padding
+        };
 
         let content_left = bounds.left() + gutter_width;
         let content_width = bounds.size.width - gutter_width;
@@ -2568,6 +2578,9 @@ impl Element for MultiLineTextElement {
         // Shape line numbers
         let mut gutter_line_numbers = Vec::with_capacity(visible_line_tops.len());
         for &(i, visual_y) in &visible_line_tops {
+            if self.input.read(cx).compact_input {
+                break;
+            }
             let y = visual_y - scroll_offset.y;
             let visual_height = line_height * visual_line_counts.get(i).copied().unwrap_or(1);
             if y + visual_height >= px(0.) && y <= bounds.size.height {
