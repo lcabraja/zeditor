@@ -17,6 +17,8 @@ macOS popup editor built with GPUI.
 - `src/main.rs` — App entry, window setup, keybindings
 - `src/editor.rs` — Multi-line editor with multi-cursor support
 - `src/hotkey.rs` — Global Option+Cmd+V hotkey, menu bar icon
+- `src/history_hotkey.rs` — Intercept Cmd+Shift+V only in the focused popup
+- `src/clipboard_history.rs` — Read-only Alfred history loader and searchable picker
 - `src/theme.rs` — Catppuccin Mocha theme
 - `Info.plist` — App bundle config (LSUIElement for no Dock icon)
 
@@ -24,6 +26,8 @@ macOS popup editor built with GPUI.
 
 - **Option+Cmd+V** — Toggle popup (global, requires Accessibility permissions)
 - **Escape** — Collapse multi-cursors, then hide popup
+- **Cmd+Shift+V** — Open Alfred clipboard history in the focused popup
+- **Enter in history** — Insert the selected clip for editing
 - **Alt+Up/Down** — Move line up/down
 - **Alt+Shift+Up/Down** — Add cursor above/below
 

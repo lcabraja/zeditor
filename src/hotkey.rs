@@ -107,12 +107,14 @@ static PENDING_CLIPBOARD: Mutex<Option<Option<String>>> = Mutex::new(None);
 pub struct PendingRequests {
     pub show_window: bool,
     pub open_preferences: bool,
+    pub open_clipboard_history: bool,
 }
 
 #[derive(Default)]
 struct RequestState {
     show_window: bool,
     open_preferences: bool,
+    open_clipboard_history: bool,
 }
 
 fn request_state() -> &'static (Mutex<RequestState>, Condvar) {
@@ -138,12 +140,30 @@ fn request_open_preferences() {
     signal_request(|state| state.open_preferences = true);
 }
 
+pub fn request_clipboard_history() {
+    signal_request(|state| state.open_clipboard_history = true);
+}
+
+/// Only the visible popup may intercept Alfred's shortcut. Called from the
+/// main run loop, so AppKit state can be inspected without crossing threads.
+pub unsafe fn popup_is_active() -> bool {
+    let ns_window = GLOBAL_WINDOW.load(Ordering::SeqCst) as *mut Object;
+    let visible = GLOBAL_VISIBLE.load(Ordering::SeqCst) as *mut Arc<AtomicBool>;
+    if ns_window.is_null() || visible.is_null() || !(*visible).load(Ordering::SeqCst) {
+        return false;
+    }
+    let app: id = msg_send![class!(NSApplication), sharedApplication];
+    let active: bool = msg_send![app, isActive];
+    let key_window: id = msg_send![app, keyWindow];
+    active && key_window == ns_window
+}
+
 /// Wait until at least one UI request is pending, then drain the current batch.
 pub fn wait_for_requests() -> PendingRequests {
     logging::event("hotkey.wait_for_requests", "waiting");
     let (lock, condvar) = request_state();
     let mut state = lock.lock().expect("request state lock poisoned");
-    while !state.show_window && !state.open_preferences {
+    while !state.show_window && !state.open_preferences && !state.open_clipboard_history {
         state = condvar
             .wait(state)
             .expect("request state lock poisoned while waiting");
@@ -152,6 +172,7 @@ pub fn wait_for_requests() -> PendingRequests {
     let requests = PendingRequests {
         show_window: std::mem::take(&mut state.show_window),
         open_preferences: std::mem::take(&mut state.open_preferences),
+        open_clipboard_history: std::mem::take(&mut state.open_clipboard_history),
     };
     logging::event(
         "hotkey.wait_for_requests",
@@ -438,6 +459,8 @@ pub unsafe fn register_hotkey(ns_window: *mut Object, key_code: u32, modifiers: 
 
     // Register Carbon global hotkey
     register_carbon_hotkey(ns_window, visible.clone(), key_code, modifiers);
+
+    crate::history_hotkey::install();
 
     // Register for app deactivation to auto-hide window
     register_deactivation_observer(ns_window, visible);

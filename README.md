@@ -42,6 +42,7 @@ can send the paste keystroke to the previous application.
 | --- | --- |
 | Option+Cmd+V | Toggle popup globally; configurable in preferences |
 | Cmd+Enter | Submit text and paste into the previous application |
+| Cmd+Shift+V | Search Alfred clipboard history while the popup is active |
 | Escape | Collapse multiple cursors; with one cursor, hide the popup |
 | Cmd+, | Open preferences |
 | Option+Up / Down | Move the current line |
@@ -51,6 +52,26 @@ can send the paste keystroke to the previous application.
 Record a new shortcut in preferences, then click Save. Registration or file
 errors stay visible in the preferences window and leave the previous shortcut
 active. Preference files are replaced atomically to avoid partial JSON writes.
+
+## Alfred clipboard history
+
+With the popup focused, press Cmd+Shift+V or click History in the header.
+Type to search the full retained history, use Up/Down to choose a clip, then
+press Enter or click it to insert its text at the editor's cursors. Selected
+text is replaced. Multi-cursor insertion follows the same rules as Cmd+V.
+Edit the inserted text, then press Cmd+Enter to paste into the previous app.
+Escape cancels the picker and restores the existing editor state.
+
+The picker reads Alfred's local clipboard database without modifying it or
+changing the system clipboard. File entries insert their full paths, one per
+line. Images appear in the list but cannot be inserted
+into the text editor. The database format is internal to Alfred and may change
+in future versions. Missing history or read errors appear inside the picker.
+
+Intercepting Alfred's global Cmd+Shift+V shortcut requires Zeditor's existing
+Accessibility permission. Outside the focused popup, including in preferences,
+the shortcut passes through to Alfred. The History button works even if macOS
+prevents shortcut interception.
 
 ## Files and launchers
 

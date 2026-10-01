@@ -1,5 +1,8 @@
 mod assets;
+mod clipboard_history;
 mod editor;
+#[cfg(target_os = "macos")]
+mod history_hotkey;
 #[cfg(target_os = "macos")]
 mod hotkey;
 mod logging;
@@ -8,6 +11,7 @@ mod preferences_window;
 mod theme;
 
 use assets::*;
+use clipboard_history::{ClipboardHistory, HistoryEvent};
 use editor::*;
 use gpui::*;
 use preferences::*;
@@ -19,12 +23,20 @@ use raw_window_handle::HasWindowHandle;
 
 actions!(
     popup_editor,
-    [Quit, Escape, SubmitAndPaste, OpenPreferences]
+    [
+        Quit,
+        Escape,
+        SubmitAndPaste,
+        OpenPreferences,
+        OpenClipboardHistory
+    ]
 );
 
 pub struct PopupEditor {
     editor: Entity<MultiLineEditor>,
     last_clipboard_hash: u64,
+    history: Option<Entity<ClipboardHistory>>,
+    history_subscription: Option<Subscription>,
 }
 
 impl PopupEditor {
@@ -33,6 +45,8 @@ impl PopupEditor {
         Self {
             editor,
             last_clipboard_hash: 0,
+            history: None,
+            history_subscription: None,
         }
     }
 
@@ -40,6 +54,8 @@ impl PopupEditor {
     /// changed since last open. If changed, replaces editor contents. If same,
     /// keeps existing editor state.
     fn on_show(&mut self, cx: &mut Context<Self>) {
+        self.history = None;
+        self.history_subscription = None;
         // Check for CLI/pipe initial text first
         #[cfg(target_os = "macos")]
         if let Some(initial_text) = hotkey::take_pending_clipboard() {
@@ -74,6 +90,39 @@ impl PopupEditor {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         s.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn open_clipboard_history(
+        &mut self,
+        _: &OpenClipboardHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_window_active() {
+            return;
+        }
+        if let Some(history) = &self.history {
+            window.focus(&history.read(cx).search.read(cx).focus_handle);
+            return;
+        }
+        let history = cx.new(ClipboardHistory::new);
+        window.focus(&history.read(cx).search.read(cx).focus_handle);
+        self.history_subscription =
+            Some(
+                cx.subscribe_in(&history, window, |this, _, event, window, cx| {
+                    if let HistoryEvent::Selected(text) = event {
+                        this.editor.update(cx, |editor, cx| {
+                            editor.insert_history_text(text, window, cx);
+                        });
+                    }
+                    this.history = None;
+                    this.history_subscription = None;
+                    window.focus(&this.editor.read(cx).focus_handle);
+                    cx.notify();
+                }),
+            );
+        self.history = Some(history);
+        cx.notify();
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
@@ -156,6 +205,7 @@ impl Render for PopupEditor {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::submit_and_paste))
             .on_action(cx.listener(Self::open_preferences))
+            .on_action(cx.listener(Self::open_clipboard_history))
             .flex()
             .flex_col()
             .size_full()
@@ -182,6 +232,17 @@ impl Render for PopupEditor {
                     )
                     .child(
                         div()
+                            .id("clipboard-history-button")
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(theme.subtext0)
+                            .child("History ⌘⇧V")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_clipboard_history(&OpenClipboardHistory, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
                             .text_size(px(11.))
                             .text_color(theme.overlay0)
                             .child(self.editor.read(cx).status_text()),
@@ -189,12 +250,13 @@ impl Render for PopupEditor {
             )
             .child(
                 // Editor area
-                div()
-                    .flex()
-                    .flex_1()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(self.editor.clone()),
+                div().flex().flex_1().w_full().overflow_hidden().child(
+                    if let Some(history) = &self.history {
+                        history.clone().into_any_element()
+                    } else {
+                        self.editor.clone().into_any_element()
+                    },
+                ),
             )
     }
 }
@@ -248,6 +310,7 @@ fn main() {
             // App-level keybindings
             KeyBinding::new("escape", Escape, Some("PopupEditor")),
             KeyBinding::new("cmd-enter", SubmitAndPaste, Some("PopupEditor")),
+            KeyBinding::new("cmd-shift-v", OpenClipboardHistory, Some("PopupEditor")),
             KeyBinding::new("cmd-,", OpenPreferences, Some("PopupEditor")),
             KeyBinding::new("cmd-q", Quit, None),
             // Editor keybindings
@@ -389,11 +452,17 @@ fn main() {
 
                     if requests.show_window {
                         window_handle
-                            .update(cx, |root: &mut PopupEditor, _window, cx| {
+                            .update(cx, |root: &mut PopupEditor, window, cx| {
                                 root.on_show(cx);
+                                window.focus(&root.editor.read(cx).focus_handle);
                             })
                             .ok();
                         unsafe { hotkey::show_window_now() };
+                    }
+                    if requests.open_clipboard_history {
+                        let _ = window_handle.update(cx, |root: &mut PopupEditor, window, cx| {
+                            root.open_clipboard_history(&OpenClipboardHistory, window, cx);
+                        });
                     }
                 }
             })

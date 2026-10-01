@@ -1067,11 +1067,19 @@ impl MultiLineEditor {
         window.show_character_palette();
     }
 
+    pub fn insert_history_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        if self.cursors.len() > 1 && lines.len() == self.cursors.len() {
+            self.insert_lines_at_ordered_cursors(lines, window, cx);
+        } else {
+            self.insert_text_at_cursors(text, window, cx);
+        }
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         let op_id = logging::next_operation_id();
         let started = Instant::now();
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let clipboard_lines: Vec<String> = text.split('\n').map(str::to_string).collect();
             logging::event(
                 "editor.paste",
                 format!(
@@ -1082,11 +1090,7 @@ impl MultiLineEditor {
                     started.elapsed().as_millis()
                 ),
             );
-            if self.cursors.len() > 1 && clipboard_lines.len() == self.cursors.len() {
-                self.insert_lines_at_ordered_cursors(clipboard_lines, window, cx);
-            } else {
-                self.insert_text_at_cursors(&text, window, cx);
-            }
+            self.insert_history_text(&text, window, cx);
             logging::event(
                 "editor.paste",
                 format!(
