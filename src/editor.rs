@@ -54,6 +54,8 @@ actions!(
         MoveLineDown,
         AddCursorUp,
         AddCursorDown,
+        AddCursorsToTop,
+        AddCursorsToBottom,
         SubmitAndPaste,
         SelectHome,
         SelectEnd,
@@ -117,6 +119,80 @@ impl Cursor {
             _ => self.position.clone(),
         }
     }
+}
+
+fn unwrapped_visible_line_range(
+    scroll_y: Pixels,
+    viewport_height: Pixels,
+    line_height: Pixels,
+    line_count: usize,
+) -> Range<usize> {
+    if line_count == 0 || line_height <= px(0.) {
+        return 0..0;
+    }
+
+    let first_visible = if scroll_y <= px(0.) {
+        0
+    } else {
+        (scroll_y / line_height) as usize
+    };
+    let visible_count = (viewport_height / line_height) as usize + 3;
+    let start = first_visible.saturating_sub(1).min(line_count);
+    let end = first_visible
+        .saturating_add(visible_count)
+        .min(line_count)
+        .max(start);
+    start..end
+}
+
+fn wrapped_visible_line_range(
+    visual_line_counts: &[usize],
+    scroll_y: Pixels,
+    viewport_height: Pixels,
+    line_height: Pixels,
+) -> Range<usize> {
+    if visual_line_counts.is_empty() || line_height <= px(0.) {
+        return 0..0;
+    }
+
+    let visible_top = if scroll_y <= px(0.) { px(0.) } else { scroll_y };
+    let visible_bottom = visible_top + viewport_height;
+    let mut visual_y = px(0.);
+    let mut start = None;
+    let mut end = 0;
+
+    for (line, &visual_line_count) in visual_line_counts.iter().enumerate() {
+        let visual_height = line_height * visual_line_count;
+        if visual_y > visible_bottom && start.is_some() {
+            break;
+        }
+        if visual_y + visual_height >= visible_top && visual_y <= visible_bottom {
+            start.get_or_insert(line);
+            end = line + 1;
+        }
+        visual_y += visual_height;
+    }
+
+    start.map_or(0..0, |start| start..end)
+}
+
+fn cursor_intersects_line_range(cursor: &Cursor, range: &Range<usize>) -> bool {
+    if range.start >= range.end {
+        return false;
+    }
+
+    if let Some((start, end)) = cursor.selection_range() {
+        start.line < range.end && end.line >= range.start
+    } else {
+        range.contains(&cursor.position.line)
+    }
+}
+
+struct CursorEdit {
+    cursor_index: usize,
+    start: CursorPosition,
+    end: CursorPosition,
+    replacement: String,
 }
 
 pub struct MultiLineEditor {
@@ -433,6 +509,37 @@ impl MultiLineEditor {
                 false
             }
         });
+    }
+
+    fn ordered_cursor_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..self.cursors.len()).collect();
+        indices.sort_by_key(|idx| self.cursors[*idx].selection_start());
+        indices
+    }
+
+    fn selected_texts_in_cursor_order(&self) -> Vec<String> {
+        self.ordered_cursor_indices()
+            .into_iter()
+            .map(|idx| {
+                self.cursors[idx]
+                    .selection_range()
+                    .map(|(start, end)| self.text_in_range(&start, &end))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn current_line_texts_in_cursor_order(&self) -> Vec<String> {
+        self.ordered_cursor_indices()
+            .into_iter()
+            .map(|idx| {
+                let line = self.cursors[idx]
+                    .position
+                    .line
+                    .min(self.lines.len().saturating_sub(1));
+                self.lines[line].clone()
+            })
+            .collect()
     }
 
     // --- Navigation helpers ---
@@ -906,6 +1013,51 @@ impl MultiLineEditor {
         cx.notify();
     }
 
+    fn add_cursors_to_top(&mut self, _: &AddCursorsToTop, _: &mut Window, cx: &mut Context<Self>) {
+        let first_line = self
+            .cursors
+            .iter()
+            .map(|c| c.position.line)
+            .min()
+            .unwrap_or(0);
+        if first_line == 0 {
+            return;
+        }
+
+        for line in 0..first_line {
+            let col = self.col_for_preferred_x(line, cx);
+            self.cursors.push(Cursor::new(line, col));
+        }
+        self.merge_overlapping_cursors();
+        self.reset_cursor_blink(cx);
+        cx.notify();
+    }
+
+    fn add_cursors_to_bottom(
+        &mut self,
+        _: &AddCursorsToBottom,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let last_line = self
+            .cursors
+            .iter()
+            .map(|c| c.position.line)
+            .max()
+            .unwrap_or(0);
+        if last_line + 1 >= self.lines.len() {
+            return;
+        }
+
+        for line in (last_line + 1)..self.lines.len() {
+            let col = self.col_for_preferred_x(line, cx);
+            self.cursors.push(Cursor::new(line, col));
+        }
+        self.merge_overlapping_cursors();
+        self.reset_cursor_blink(cx);
+        cx.notify();
+    }
+
     fn show_character_palette(
         &mut self,
         _: &ShowCharacterPalette,
@@ -919,6 +1071,7 @@ impl MultiLineEditor {
         let op_id = logging::next_operation_id();
         let started = Instant::now();
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let clipboard_lines: Vec<String> = text.split('\n').map(str::to_string).collect();
             logging::event(
                 "editor.paste",
                 format!(
@@ -929,7 +1082,11 @@ impl MultiLineEditor {
                     started.elapsed().as_millis()
                 ),
             );
-            self.insert_text_at_cursors(&text, window, cx);
+            if self.cursors.len() > 1 && clipboard_lines.len() == self.cursors.len() {
+                self.insert_lines_at_ordered_cursors(clipboard_lines, window, cx);
+            } else {
+                self.insert_text_at_cursors(&text, window, cx);
+            }
             logging::event(
                 "editor.paste",
                 format!(
@@ -951,26 +1108,35 @@ impl MultiLineEditor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        let c = &self.cursors[0];
-        if let Some((start, end)) = c.selection_range() {
-            let text = self.text_in_range(&start, &end);
+        let has_selection = self.cursors.iter().any(|c| c.has_selection());
+        if has_selection {
+            let text = self.selected_texts_in_cursor_order().join("\n");
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        } else if self.cursors.len() > 1 {
+            let text = self.current_line_texts_in_cursor_order().join("\n");
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        let c = &self.cursors[0];
-        if let Some((start, end)) = c.selection_range() {
-            let text = self.text_in_range(&start, &end);
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let has_selection = self.cursors.iter().any(|c| c.has_selection());
+        if has_selection {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.selected_texts_in_cursor_order().join("\n"),
+            ));
             self.insert_text_at_cursors("", window, cx);
+        } else if self.cursors.len() > 1 {
+            self.cut_current_lines(cx);
         } else {
             self.cut_current_line(cx);
         }
     }
 
     fn cut_current_line(&mut self, cx: &mut Context<Self>) {
-        let line = self.cursors[0].position.line.min(self.lines.len().saturating_sub(1));
+        let line = self.cursors[0]
+            .position
+            .line
+            .min(self.lines.len().saturating_sub(1));
         let text = format!("{}\n", self.lines[line]);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
 
@@ -991,6 +1157,52 @@ impl MultiLineEditor {
         self.request_scroll_to_cursor();
         self.reset_cursor_blink(cx);
         cx.notify();
+    }
+
+    fn cut_current_lines(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            self.current_line_texts_in_cursor_order().join("\n"),
+        ));
+
+        let mut lines_to_cut: Vec<usize> = self
+            .cursors
+            .iter()
+            .map(|c| c.position.line.min(self.lines.len().saturating_sub(1)))
+            .collect();
+        lines_to_cut.sort_unstable();
+        lines_to_cut.dedup();
+
+        let last_line = self.lines.len().saturating_sub(1);
+        let edits = lines_to_cut
+            .into_iter()
+            .enumerate()
+            .map(|(cursor_index, line)| {
+                let (start, end) = if self.lines.len() == 1 {
+                    (
+                        CursorPosition::new(0, 0),
+                        CursorPosition::new(0, self.lines[0].len()),
+                    )
+                } else if line == last_line {
+                    (
+                        CursorPosition::new(line - 1, self.lines[line - 1].len()),
+                        CursorPosition::new(line, self.lines[line].len()),
+                    )
+                } else {
+                    (
+                        CursorPosition::new(line, 0),
+                        CursorPosition::new(line + 1, 0),
+                    )
+                };
+                CursorEdit {
+                    cursor_index,
+                    start,
+                    end,
+                    replacement: String::new(),
+                }
+            })
+            .collect();
+
+        self.apply_cursor_edits(edits, cx);
     }
 
     /// Get the text to submit/paste.
@@ -1204,42 +1416,24 @@ impl MultiLineEditor {
             ),
         );
 
-        // Sort cursors in reverse document order (bottom-first)
-        let mut indexed: Vec<(usize, Cursor)> = self.cursors.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.position.cmp(&a.1.position));
-
-        let mut new_positions: Vec<(usize, CursorPosition)> = Vec::new();
-
-        for (orig_idx, c) in &indexed {
-            let (del_start, del_end) = if let Some((s, e)) = c.selection_range() {
-                (s, e)
-            } else {
-                (c.position.clone(), c.position.clone())
-            };
-
-            let after = self.delete_range(&del_start, &del_end);
-            let inserted_pos = self.insert_at(&del_start, text);
-            new_positions.push((*orig_idx, inserted_pos.clone()));
-
-            // Adjust subsequent cursor positions for the offset change
-            let _ = after; // line/col shift is handled implicitly by operating bottom-first
-        }
-
-        // Rebuild cursors in original order
-        new_positions.sort_by_key(|(idx, _)| *idx);
-        self.cursors = new_positions
-            .into_iter()
-            .map(|(_, pos)| Cursor::new(pos.line, pos.col))
+        let edits = self
+            .cursors
+            .iter()
+            .enumerate()
+            .map(|(cursor_index, c)| {
+                let (start, end) = c
+                    .selection_range()
+                    .unwrap_or_else(|| (c.position.clone(), c.position.clone()));
+                CursorEdit {
+                    cursor_index,
+                    start,
+                    end,
+                    replacement: text.to_string(),
+                }
+            })
             .collect();
 
-        self.merge_overlapping_cursors();
-        self.marked_range = None;
-        self.recalculate_total_chars();
-        self.invalidate_layout_cache();
-        self.preferred_col_x = None;
-        self.request_scroll_to_cursor();
-        self.reset_cursor_blink(cx);
-        cx.notify();
+        self.apply_cursor_edits(edits, cx);
         logging::event(
             "editor.insert_text_at_cursors",
             format!(
@@ -1251,6 +1445,37 @@ impl MultiLineEditor {
                 self.total_chars
             ),
         );
+    }
+
+    fn insert_lines_at_ordered_cursors(
+        &mut self,
+        lines: Vec<String>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut replacements = vec![String::new(); self.cursors.len()];
+        for (cursor_index, line) in self.ordered_cursor_indices().into_iter().zip(lines) {
+            replacements[cursor_index] = line;
+        }
+
+        let edits = self
+            .cursors
+            .iter()
+            .enumerate()
+            .map(|(cursor_index, c)| {
+                let (start, end) = c
+                    .selection_range()
+                    .unwrap_or_else(|| (c.position.clone(), c.position.clone()));
+                CursorEdit {
+                    cursor_index,
+                    start,
+                    end,
+                    replacement: replacements[cursor_index].clone(),
+                }
+            })
+            .collect();
+
+        self.apply_cursor_edits(edits, cx);
     }
 
     fn edit_with_cursors<F>(
@@ -1280,6 +1505,81 @@ impl MultiLineEditor {
     }
 
     // --- Low-level text mutation ---
+
+    fn apply_cursor_edits(&mut self, edits: Vec<CursorEdit>, cx: &mut Context<Self>) {
+        if edits.is_empty() {
+            return;
+        }
+
+        let original_text = self.lines.join("\n");
+        let mut flat_edits: Vec<(usize, usize, usize, String)> = edits
+            .into_iter()
+            .map(|edit| {
+                (
+                    edit.cursor_index,
+                    self.flat_offset(&edit.start),
+                    self.flat_offset(&edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect();
+
+        flat_edits.sort_by_key(|(_, start, end, _)| (*start, *end));
+
+        let mut new_text = String::with_capacity(
+            original_text.len()
+                + flat_edits
+                    .iter()
+                    .map(|(_, start, end, replacement)| {
+                        replacement.len().saturating_sub(end.saturating_sub(*start))
+                    })
+                    .sum::<usize>(),
+        );
+        let mut last_offset = 0usize;
+        let mut cursor_offsets: Vec<(usize, usize)> = Vec::with_capacity(flat_edits.len());
+
+        for (cursor_index, start, end, replacement) in flat_edits {
+            let start = start.min(original_text.len());
+            let end = end.min(original_text.len()).max(start);
+
+            if start < last_offset {
+                cursor_offsets.push((cursor_index, new_text.len()));
+                continue;
+            }
+
+            new_text.push_str(&original_text[last_offset..start]);
+            new_text.push_str(&replacement);
+            cursor_offsets.push((cursor_index, new_text.len()));
+            last_offset = end;
+        }
+        new_text.push_str(&original_text[last_offset..]);
+
+        self.lines = new_text.split('\n').map(str::to_string).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+
+        cursor_offsets.sort_by_key(|(idx, _)| *idx);
+        self.cursors = cursor_offsets
+            .into_iter()
+            .map(|(_, offset)| {
+                let position = self.position_from_flat(offset);
+                Cursor::new(position.line, position.col)
+            })
+            .collect();
+        if self.cursors.is_empty() {
+            self.cursors.push(Cursor::new(0, 0));
+        }
+
+        self.merge_overlapping_cursors();
+        self.marked_range = None;
+        self.recalculate_total_chars();
+        self.invalidate_layout_cache();
+        self.preferred_col_x = None;
+        self.request_scroll_to_cursor();
+        self.reset_cursor_blink(cx);
+        cx.notify();
+    }
 
     /// Delete a range and return the deleted text
     fn delete_range(&mut self, start: &CursorPosition, end: &CursorPosition) -> String {
@@ -1946,6 +2246,8 @@ impl Render for MultiLineEditor {
             .on_action(cx.listener(Self::move_line_down))
             .on_action(cx.listener(Self::add_cursor_up))
             .on_action(cx.listener(Self::add_cursor_down))
+            .on_action(cx.listener(Self::add_cursors_to_top))
+            .on_action(cx.listener(Self::add_cursors_to_bottom))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
@@ -1987,6 +2289,7 @@ struct MultiLinePrepaintState {
     wrapped_lines: Vec<WrappedLine>,
     word_wrap: bool,
     visual_line_counts: Vec<usize>,
+    visible_line_tops: Vec<(usize, Pixels)>,
     max_line_width: Pixels,
     cursors: Vec<(Bounds<Pixels>, Rgba)>,
     cursor_opacity: f32,
@@ -2117,7 +2420,24 @@ impl Element for MultiLineTextElement {
                 input.cursor_opacity,
                 input.word_wrap,
                 input.focus_handle.clone(),
-                input.cursors.clone(),
+                {
+                    let render_line_range = if input.word_wrap {
+                        0..input.lines.len()
+                    } else {
+                        unwrapped_visible_line_range(
+                            input.scroll_offset.y,
+                            bounds.size.height,
+                            line_height,
+                            input.lines.len(),
+                        )
+                    };
+                    input
+                        .cursors
+                        .iter()
+                        .filter(|cursor| cursor_intersects_line_range(cursor, &render_line_range))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                },
                 input
                     .lines
                     .iter()
@@ -2206,13 +2526,46 @@ impl Element for MultiLineTextElement {
             }
         }
 
+        let visible_line_range = if word_wrap {
+            wrapped_visible_line_range(
+                &visual_line_counts,
+                scroll_offset.y,
+                bounds.size.height,
+                line_height,
+            )
+        } else {
+            unwrapped_visible_line_range(
+                scroll_offset.y,
+                bounds.size.height,
+                line_height,
+                line_count,
+            )
+        };
+        let visible_line_tops = if word_wrap {
+            let mut tops = Vec::with_capacity(visible_line_range.len());
+            let mut visual_y = px(0.);
+            for (line, &visual_line_count) in visual_line_counts.iter().enumerate() {
+                if line >= visible_line_range.end {
+                    break;
+                }
+                if line >= visible_line_range.start {
+                    tops.push((line, visual_y));
+                }
+                visual_y += line_height * visual_line_count;
+            }
+            tops
+        } else {
+            visible_line_range
+                .clone()
+                .map(|line| (line, line_height * line))
+                .collect::<Vec<_>>()
+        };
+
         // Shape line numbers
-        let mut gutter_line_numbers = Vec::with_capacity(line_count);
-        let mut visual_y = px(0.);
-        for (i, &vcount) in visual_line_counts.iter().enumerate() {
+        let mut gutter_line_numbers = Vec::with_capacity(visible_line_tops.len());
+        for &(i, visual_y) in &visible_line_tops {
             let y = visual_y - scroll_offset.y;
-            // Only shape if potentially visible
-            let visual_height = line_height * vcount;
+            let visual_height = line_height * visual_line_counts.get(i).copied().unwrap_or(1);
             if y + visual_height >= px(0.) && y <= bounds.size.height {
                 let num_str: SharedString = format!("{}", i + 1).into();
                 let num_run = TextRun {
@@ -2229,7 +2582,6 @@ impl Element for MultiLineTextElement {
                         .shape_line(num_str, font_size, &[num_run], None);
                 gutter_line_numbers.push((shaped_num, y));
             }
-            visual_y += visual_height;
         }
 
         // Build cursor rects and selection rects
@@ -2239,13 +2591,24 @@ impl Element for MultiLineTextElement {
 
         // Helper: compute the visual Y offset for a logical line
         let visual_y_for_line = |line: usize| -> Pixels {
-            let visual_lines_before: usize = visual_line_counts.iter().take(line).sum();
-            line_height * visual_lines_before
+            if word_wrap {
+                visible_line_tops
+                    .iter()
+                    .find(|(visible_line, _)| *visible_line == line)
+                    .map(|(_, y)| *y)
+                    .unwrap_or(px(0.))
+            } else {
+                line_height * line
+            }
         };
 
         if word_wrap {
             // Wrapped mode: use WrappedLineLayout position_for_index
             for c in &cursors {
+                if !cursor_intersects_line_range(c, &visible_line_range) {
+                    continue;
+                }
+                let cursor_line_visible = visible_line_range.contains(&c.position.line);
                 let base_y = visual_y_for_line(c.position.line);
                 let (cx_offset, cy_offset) = if let Some(wl) = wrapped_lines.get(c.position.line) {
                     if let Some(pos) = wl.position_for_index(c.position.col, line_height) {
@@ -2262,7 +2625,7 @@ impl Element for MultiLineTextElement {
                     bounds.top() + base_y + cy_offset - scroll_offset.y,
                 );
 
-                if !c.has_selection() && is_focused {
+                if !c.has_selection() && is_focused && cursor_line_visible {
                     cursor_rects.push((
                         Bounds::new(cursor_screen, size(px(2.), line_height)),
                         accent_color,
@@ -2270,12 +2633,17 @@ impl Element for MultiLineTextElement {
                 }
 
                 if let Some((start, end)) = c.selection_range() {
+                    let start_line = start.line.max(visible_line_range.start);
+                    let end_line = end.line.min(visible_line_range.end.saturating_sub(1));
+                    if start_line > end_line {
+                        continue;
+                    }
                     // For wrapped selections, paint per-visual-line segments
                     for (line_idx, line_len) in line_lengths
                         .iter()
                         .enumerate()
-                        .take(end.line + 1)
-                        .skip(start.line)
+                        .take(end_line + 1)
+                        .skip(start_line)
                     {
                         let col_start = if line_idx == start.line { start.col } else { 0 };
                         let col_end = if line_idx == end.line {
@@ -2366,7 +2734,7 @@ impl Element for MultiLineTextElement {
                     }
 
                     // Cursor at selection edge
-                    if is_focused {
+                    if is_focused && cursor_line_visible {
                         cursor_rects.push((
                             Bounds::new(cursor_screen, size(px(2.), line_height)),
                             accent_color,
@@ -2400,11 +2768,16 @@ impl Element for MultiLineTextElement {
 
             for c in &cursors {
                 if let Some((start, end)) = c.selection_range() {
+                    let start_line = start.line.max(visible_line_range.start);
+                    let end_line = end.line.min(visible_line_range.end.saturating_sub(1));
+                    if start_line > end_line {
+                        continue;
+                    }
                     for (line_idx, line_len) in line_lengths
                         .iter()
                         .enumerate()
-                        .take(end.line + 1)
-                        .skip(start.line)
+                        .take(end_line + 1)
+                        .skip(start_line)
                     {
                         let col_start = if line_idx == start.line { start.col } else { 0 };
                         let col_end = if line_idx == end.line {
@@ -2438,7 +2811,7 @@ impl Element for MultiLineTextElement {
                         ));
                     }
 
-                    if is_focused {
+                    if is_focused && visible_line_range.contains(&c.position.line) {
                         let x = shaped_lines
                             .get(c.position.line)
                             .map(|l| l.x_for_index(c.position.col))
@@ -2464,6 +2837,7 @@ impl Element for MultiLineTextElement {
             wrapped_lines,
             word_wrap,
             visual_line_counts,
+            visible_line_tops,
             max_line_width,
             cursors: cursor_rects,
             cursor_opacity,
@@ -2519,9 +2893,12 @@ impl Element for MultiLineTextElement {
 
                 if prepaint.word_wrap {
                     // Paint wrapped lines
-                    let mut visual_y = px(0.);
-                    for (i, wrapped) in prepaint.wrapped_lines.iter().enumerate() {
-                        let visual_height = line_height * prepaint.visual_line_counts[i];
+                    for &(i, visual_y) in &prepaint.visible_line_tops {
+                        let Some(wrapped) = prepaint.wrapped_lines.get(i) else {
+                            continue;
+                        };
+                        let visual_height =
+                            line_height * prepaint.visual_line_counts.get(i).copied().unwrap_or(1);
                         let y = bounds.top() + visual_y - scroll_offset.y;
                         // Skip lines outside visible bounds
                         if y + visual_height >= bounds.top() && y <= bounds.bottom() {
@@ -2530,12 +2907,14 @@ impl Element for MultiLineTextElement {
                                 .paint(origin, line_height, TextAlign::Left, None, window, cx)
                                 .ok();
                         }
-                        visual_y += visual_height;
                     }
                 } else {
                     // Paint unwrapped lines
-                    for (i, shaped) in prepaint.shaped_lines.iter().enumerate() {
-                        let y = bounds.top() + line_height * i - scroll_offset.y;
+                    for &(i, visual_y) in &prepaint.visible_line_tops {
+                        let Some(shaped) = prepaint.shaped_lines.get(i) else {
+                            continue;
+                        };
+                        let y = bounds.top() + visual_y - scroll_offset.y;
                         if y + line_height < bounds.top() || y > bounds.bottom() {
                             continue;
                         }

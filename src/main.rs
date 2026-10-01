@@ -283,6 +283,12 @@ fn main() {
             KeyBinding::new("alt-down", MoveLineDown, Some("MultiLineEditor")),
             KeyBinding::new("cmd-alt-up", AddCursorUp, Some("MultiLineEditor")),
             KeyBinding::new("cmd-alt-down", AddCursorDown, Some("MultiLineEditor")),
+            KeyBinding::new("ctrl-alt-cmd-up", AddCursorsToTop, Some("MultiLineEditor")),
+            KeyBinding::new(
+                "ctrl-alt-cmd-down",
+                AddCursorsToBottom,
+                Some("MultiLineEditor"),
+            ),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("MultiLineEditor")),
             KeyBinding::new("cmd-v", Paste, Some("MultiLineEditor")),
             KeyBinding::new("cmd-c", Copy, Some("MultiLineEditor")),
