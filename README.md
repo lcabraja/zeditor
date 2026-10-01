@@ -64,10 +64,16 @@ Escape cancels the picker and restores the existing editor state.
 
 The left pane shows source-app icons and a full-width selection. Single-click
 to preview an item in the right pane. Search matches are highlighted in the
-list and full-text preview. Cmd+1 through Cmd+9 insert the corresponding visible
-row; the selected editable row shows a Return indicator. Word count, character
+list and full-text preview. Cmd+1 through Cmd+9 stay assigned to the first nine
+search results. If the target row is more than 85% visible, the shortcut inserts
+it. Otherwise it scrolls to that row; press the shortcut again to insert it.
+The selected editable row shows a Return indicator. Word count, character
 count, and the copy time appear below the preview. The search field has no line
 number gutter.
+
+The first screenful loads immediately, followed by batches of 200. Search
+updates as each batch arrives, with a spinner below the last result while
+loading. Image rows and their shortcuts appear dimmed.
 
 The picker reads Alfred's local clipboard database without modifying it or
 changing the system clipboard. File entries insert their full paths, one per

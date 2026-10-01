@@ -1,10 +1,10 @@
 use std::{
-    cell::Cell,
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -14,10 +14,25 @@ use serde::Deserialize;
 use crate::{editor::MultiLineEditor, theme::Theme};
 
 const LIST_WIDTH_FRACTION: f32 = 0.54;
+const ROW_HEIGHT: f32 = 36.;
+const HISTORY_CHUNK_SIZE: usize = 200;
+
+pub fn initial_history_count(window_height: f32) -> usize {
+    // The popup header and search field occupy 74 logical pixels.
+    ((window_height - 74.).max(ROW_HEIGHT) / ROW_HEIGHT).ceil() as usize
+}
+
+#[derive(Clone, Copy)]
+struct HistoryCursor {
+    timestamp: f64,
+    row_id: i64,
+}
 
 #[derive(Deserialize)]
 pub struct HistoryItem {
     item: String,
+    row_id: i64,
+    cursor_ts: String,
     #[serde(default)]
     app: String,
     #[serde(default)]
@@ -35,7 +50,7 @@ pub struct HistoryItem {
     #[serde(skip)]
     icon: Option<Arc<Image>>,
     #[serde(skip)]
-    copied_at: String,
+    searchable: String,
 }
 
 impl HistoryItem {
@@ -122,12 +137,19 @@ fn highlighted(text: String, query: &str, highlight: HighlightStyle) -> StyledTe
     StyledText::new(text).with_highlights(ranges.into_iter().map(|range| (range, highlight)))
 }
 
-fn shortcut_index(first: usize, digit: usize, count: usize) -> Option<usize> {
+fn shortcut_index(digit: usize, count: usize) -> Option<usize> {
     if !(1..=9).contains(&digit) {
         return None;
     }
-    let index = first.checked_add(digit - 1)?;
+    let index = digit - 1;
     (index < count).then_some(index)
+}
+
+fn sufficiently_visible(index: usize, offset: f32, viewport_height: f32) -> bool {
+    let top = index as f32 * ROW_HEIGHT + offset;
+    let visible = (top + ROW_HEIGHT).min(viewport_height) - top.max(0.);
+    // Allow for subpixel rounding at the exact 85% boundary.
+    visible - ROW_HEIGHT * 0.85 > 0.001
 }
 
 fn data_file_path(directory: &Path, name: &str) -> Option<PathBuf> {
@@ -141,16 +163,29 @@ fn data_file_path(directory: &Path, name: &str) -> Option<PathBuf> {
     .then(|| directory.join(name))
 }
 
-fn read_history(path: &Path) -> Result<Vec<HistoryItem>> {
+fn read_history_chunk(
+    path: &Path,
+    cursor: Option<HistoryCursor>,
+    count: usize,
+) -> Result<Vec<HistoryItem>> {
     if !path.is_file() {
         bail!("Alfred clipboard history was not found. Enable history in Alfred first.");
     }
-    // Query the live database read-only, including every retained row. SQLite
-    // handles Alfred's locks; do not copy its database or print private clips.
+    // Keyset pagination uses Alfred's timestamp index, including rowid for ties.
+    // New clips arriving above the cursor cannot shift or duplicate later pages.
+    let after = cursor.map_or_else(String::new, |cursor| {
+        format!(
+            "AND (ts, rowid) < ({}, {})",
+            cursor.timestamp, cursor.row_id
+        )
+    });
+    let query = format!(
+        "SELECT rowid AS row_id, printf('%!.17g', ts) AS cursor_ts, CAST(item AS TEXT) AS item, COALESCE(app, '') AS app, COALESCE(apppath, '') AS apppath, CAST(ts AS REAL) AS ts, dataType, dataHash FROM clipboard WHERE item IS NOT NULL {after} ORDER BY ts DESC, rowid DESC LIMIT {count};"
+    );
     let output = Command::new("/usr/bin/sqlite3")
         .args(["-readonly", "-json", "-cmd", ".timeout 2000"])
         .arg(path)
-        .arg("SELECT CAST(item AS TEXT) AS item, COALESCE(app, '') AS app, COALESCE(apppath, '') AS apppath, CAST(ts AS REAL) AS ts, dataType, dataHash FROM clipboard WHERE item IS NOT NULL ORDER BY ts DESC, rowid DESC;")
+        .arg(query)
         .output()
         .context("Could not read Alfred clipboard history")?;
     if !output.status.success() {
@@ -165,7 +200,6 @@ fn read_history(path: &Path) -> Result<Vec<HistoryItem>> {
     data_path.push(".data");
     let data_path = std::path::PathBuf::from(data_path);
     for item in &mut items {
-        item.copied_at = crate::history_platform::copied_at(item.ts);
         let data_file = item
             .data_hash
             .as_deref()
@@ -187,6 +221,13 @@ fn read_history(path: &Path) -> Result<Vec<HistoryItem>> {
         {
             item.file_paths = Some(paths.join("\n"));
         }
+        item.searchable = format!(
+            "{} {} {}",
+            item.item,
+            item.app,
+            item.file_paths.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
     }
     Ok(items)
 }
@@ -206,14 +247,15 @@ pub struct ClipboardHistory {
     error: Option<String>,
     scroll: UniformListScrollHandle,
     preview_scroll: ScrollHandle,
-    visible_start: Cell<usize>,
+    icons: HashMap<String, Option<Arc<Image>>>,
+    spinner_frame: usize,
     _search_subscription: Subscription,
 }
 
 impl EventEmitter<HistoryEvent> for ClipboardHistory {}
 
 impl ClipboardHistory {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(initial_count: usize, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| {
             let mut input = MultiLineEditor::new(cx);
             input.compact_input = true;
@@ -223,38 +265,100 @@ impl ClipboardHistory {
             let query = search.read(cx).lines.join(" ").to_lowercase();
             if query != this.query {
                 this.query = query;
-                this.filter();
+                this.filter(true);
                 cx.notify();
             }
         });
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async {
-                    let home = dirs::home_dir().context("Could not locate your home folder")?;
-                    read_history(
-                        &home.join("Library/Application Support/Alfred/Databases/clipboard.alfdb"),
-                    )
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.loading = false;
-                match result {
-                    Ok(mut items) => {
-                        let mut icons = HashMap::new();
-                        for item in &mut items {
-                            item.icon = icons
-                                .entry(item.apppath.clone())
-                                .or_insert_with(|| crate::history_platform::app_icon(&item.apppath))
-                                .clone();
+            let started = Instant::now();
+            let mut cursor = None;
+            let mut count = initial_count.max(1);
+            loop {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let home = dirs::home_dir().context("Could not locate your home folder")?;
+                        read_history_chunk(
+                            &home.join(
+                                "Library/Application Support/Alfred/Databases/clipboard.alfdb",
+                            ),
+                            cursor,
+                            count,
+                        )
+                    })
+                    .await;
+                let (next_cursor, finished) = match &result {
+                    Ok(items) => (
+                        items.last().map(|item| HistoryCursor {
+                            timestamp: item.cursor_ts.parse().expect("SQLite numeric timestamp"),
+                            row_id: item.row_id,
+                        }),
+                        items.len() < count,
+                    ),
+                    Err(_) => (None, true),
+                };
+                if this
+                    .update(cx, |this, cx| {
+                        this.loading = !finished;
+                        match result {
+                            Ok(items) => this.items.extend(items),
+                            Err(error) => this.error = Some(error.to_string()),
                         }
-                        this.items = items;
-                    }
-                    Err(error) => this.error = Some(error.to_string()),
+                        this.filter(false);
+                        cx.notify();
+                        if cursor.is_none() {
+                            crate::logging::event(
+                                "history.first_chunk",
+                                format!(
+                                    "items={} elapsed_ms={}",
+                                    this.items.len(),
+                                    started.elapsed().as_millis()
+                                ),
+                            );
+                        }
+                        if finished {
+                            crate::logging::event(
+                                "history.complete",
+                                format!(
+                                    "items={} elapsed_ms={}",
+                                    this.items.len(),
+                                    started.elapsed().as_millis()
+                                ),
+                            );
+                        }
+                    })
+                    .is_err()
+                    || finished
+                {
+                    break;
                 }
-                this.filter();
-                cx.notify();
-            });
+                cursor = next_cursor;
+                count = HISTORY_CHUNK_SIZE;
+                // Let the first screen paint before requesting the next batch.
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let keep_animating = this
+                    .update(cx, |this, cx| {
+                        if this.loading {
+                            this.spinner_frame = (this.spinner_frame + 1) % 10;
+                            cx.notify();
+                        }
+                        this.loading
+                    })
+                    .unwrap_or(false);
+                if !keep_animating {
+                    break;
+                }
+            }
         })
         .detach();
         Self {
@@ -267,35 +371,34 @@ impl ClipboardHistory {
             error: None,
             scroll: UniformListScrollHandle::new(),
             preview_scroll: ScrollHandle::new(),
-            visible_start: Cell::new(0),
+            icons: HashMap::new(),
+            spinner_frame: 0,
             _search_subscription: subscription,
         }
     }
 
-    fn filter(&mut self) {
+    fn filter(&mut self, reset: bool) {
+        let selected_item = self.matches.get(self.selected).copied();
         let words: Vec<_> = self.query.split_whitespace().collect();
         self.matches = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                let searchable = format!(
-                    "{} {} {}",
-                    item.item,
-                    item.app,
-                    item.file_paths.as_deref().unwrap_or_default()
-                )
-                .to_lowercase();
                 words
                     .iter()
-                    .all(|word| searchable.contains(word))
+                    .all(|word| item.searchable.contains(word))
                     .then_some(index)
             })
             .collect();
-        self.selected = 0;
-        self.visible_start.set(0);
-        self.preview_scroll.set_offset(point(px(0.), px(0.)));
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.selected = selected_item
+            .and_then(|item| self.matches.iter().position(|index| *index == item))
+            .unwrap_or(0);
+        if reset {
+            self.selected = 0;
+            self.preview_scroll.set_offset(point(px(0.), px(0.)));
+            self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
     }
 
     fn accept(&mut self, cx: &mut Context<Self>) {
@@ -329,11 +432,28 @@ impl ClipboardHistory {
             return;
         }
         if let Ok(digit) = event.keystroke.key.parse::<usize>()
-            && let Some(index) = shortcut_index(self.visible_start.get(), digit, self.matches.len())
+            && let Some(index) = shortcut_index(digit, self.matches.len())
         {
+            cx.stop_propagation();
+            if event.is_held {
+                return;
+            }
             self.selected = index;
             self.preview_scroll.set_offset(point(px(0.), px(0.)));
-            self.accept(cx);
+            let visible = {
+                let scroll = self.scroll.0.borrow();
+                sufficiently_visible(
+                    index,
+                    scroll.base_handle.offset().y.into(),
+                    scroll.base_handle.bounds().size.height.into(),
+                )
+            };
+            if visible {
+                self.accept(cx);
+            } else {
+                self.scroll
+                    .scroll_to_item_strict(index, ScrollStrategy::Center);
+            }
             cx.stop_propagation();
             cx.notify();
         }
@@ -354,11 +474,21 @@ impl Render for ClipboardHistory {
             ..Default::default()
         };
         let entity = cx.entity();
-        let message = if self.loading {
-            Some("Loading Alfred history…".to_string())
-        } else if let Some(error) = &self.error {
-            Some(error.clone())
-        } else if self.matches.is_empty() {
+        // Icons are fetched only for rows around the actual viewport, not all history.
+        let first = (-f32::from(self.scroll.0.borrow().base_handle.offset().y) / ROW_HEIGHT).max(0.)
+            as usize;
+        let visible_count = initial_history_count(
+            f32::from(self.scroll.0.borrow().base_handle.bounds().size.height) + 74.,
+        ) + 2;
+        for index in self.matches.iter().skip(first).take(visible_count) {
+            let item = &mut self.items[*index];
+            item.icon = self
+                .icons
+                .entry(item.apppath.clone())
+                .or_insert_with(|| crate::history_platform::app_icon(&item.apppath))
+                .clone();
+        }
+        let message = if self.matches.is_empty() && !self.loading && self.error.is_none() {
             Some("No clipboard items found".to_string())
         } else {
             None
@@ -413,7 +543,11 @@ impl Render for ClipboardHistory {
                         .text_color(muted)
                         .text_align(TextAlign::Center)
                         .child(div().w_full().child(item.statistics()))
-                        .child(div().w_full().child(item.copied_at.clone())),
+                        .child(
+                            div()
+                                .w_full()
+                                .child(crate::history_platform::copied_at(item.ts)),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -483,11 +617,10 @@ impl Render for ClipboardHistory {
                             .child(
                                 uniform_list(
                                     "alfred-history",
-                                    self.matches.len(),
+                                    self.matches.len()
+                                        + usize::from(self.loading || self.error.is_some()),
                                     move |range, window, cx| {
                                         let this = entity.read(cx);
-                                        let first = range.start;
-                                        this.visible_start.set(first);
                                         // Virtualized rows are laid out as roots. Their percentage
                                         // widths otherwise resolve against the intrinsic text width.
                                         let row_width = window.viewport_size().width
@@ -495,14 +628,46 @@ impl Render for ClipboardHistory {
                                             - px(1.);
                                         range
                                             .map(|index| {
+                                                if index == this.matches.len() {
+                                                    let spinner = [
+                                                        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧",
+                                                        "⠇", "⠏",
+                                                    ][this.spinner_frame];
+                                                    return div()
+                                                        .w(row_width)
+                                                        .h(px(ROW_HEIGHT))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_color(muted)
+                                                        .text_size(px(14.))
+                                                        .child(
+                                                            this.error
+                                                                .clone()
+                                                                .unwrap_or_else(|| spinner.into()),
+                                                        )
+                                                        .into_any_element();
+                                                }
                                                 let item = &this.items[this.matches[index]];
                                                 let selected = this.selected == index;
-                                                let foreground =
-                                                    if selected { rgb(0xffffff) } else { text };
+                                                let foreground = if !item.editable() {
+                                                    if selected {
+                                                        rgba(0xffffff99)
+                                                    } else {
+                                                        Rgba {
+                                                            a: muted.a * 0.65,
+                                                            ..muted
+                                                        }
+                                                    }
+                                                } else if selected {
+                                                    rgb(0xffffff)
+                                                } else {
+                                                    text
+                                                };
                                                 let shortcut = if selected && item.editable() {
                                                     "↩".to_string()
-                                                } else if index >= first && index - first < 9 {
-                                                    format!("⌘{}", index - first + 1)
+                                                } else if index < 9 {
+                                                    format!("⌘{}", index + 1)
                                                 } else {
                                                     String::new()
                                                 };
@@ -522,7 +687,7 @@ impl Render for ClipboardHistory {
                                                 div()
                                                     .id(index)
                                                     .w(row_width)
-                                                    .h(px(36.))
+                                                    .h(px(ROW_HEIGHT))
                                                     .flex_shrink_0()
                                                     .px(px(8.))
                                                     .flex()
@@ -577,6 +742,7 @@ impl Render for ClipboardHistory {
                                                             cx.stop_propagation();
                                                         }
                                                     })
+                                                    .into_any_element()
                                             })
                                             .collect()
                                     },
@@ -604,7 +770,10 @@ impl Render for ClipboardHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_file_path, read_history, search_ranges, shortcut_index};
+    use super::{
+        HistoryCursor, data_file_path, initial_history_count, read_history_chunk, search_ranges,
+        shortcut_index, sufficiently_visible,
+    };
     use std::process::Command;
 
     #[test]
@@ -620,7 +789,7 @@ mod tests {
         std::fs::write(data_path.join("abc123.plist"), "<?xml version=\"1.0\"?><plist version=\"1.0\"><array><string>/tmp/file</string><string>/tmp/second file</string></array></plist>").unwrap();
         std::fs::write(data_path.join("def456.tiff"), b"fixture").unwrap();
         let before = std::fs::read(&path).unwrap();
-        let items = read_history(&path).unwrap();
+        let items = read_history_chunk(&path, None, 10).unwrap();
         assert_eq!(items.len(), 4);
         assert_eq!(
             items[0].file_paths.as_deref(),
@@ -630,7 +799,7 @@ mod tests {
         assert_eq!(items[1].item, "čćž\nsecond line");
         assert!(items[1].editable());
         assert_eq!(items[1].statistics(), "3 words; 15 chars");
-        assert!(items[1].copied_at.contains("2001"));
+        assert!(crate::history_platform::copied_at(items[1].ts).contains("2001"));
         assert!(!items[2].editable());
         assert_eq!(
             items[2].image_path.as_ref(),
@@ -641,10 +810,62 @@ mod tests {
     }
 
     #[test]
+    fn chunks_preserve_recency_ties_and_precision_when_new_clips_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipboard.alfdb");
+        let run = |sql: &str| {
+            assert!(
+                Command::new("/usr/bin/sqlite3")
+                    .arg(&path)
+                    .arg(sql)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(
+            "CREATE TABLE clipboard(item, ts, app, dataType, dataHash, apppath); CREATE INDEX clipboard_ts ON clipboard(ts); INSERT INTO clipboard VALUES ('old',1,'Test',0,NULL,''),('tie first',812345678.1234567,'Test',0,NULL,''),('tie second',812345678.1234567,'Test',0,NULL,''),('recent',900000000,'Test',0,NULL,'');",
+        );
+        let first = read_history_chunk(&path, None, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.item.as_str())
+                .collect::<Vec<_>>(),
+            ["recent", "tie second"]
+        );
+        let last = first.last().unwrap();
+        let cursor = HistoryCursor {
+            timestamp: last.cursor_ts.parse().unwrap(),
+            row_id: last.row_id,
+        };
+        run("INSERT INTO clipboard VALUES ('new clip',1000000000,'Test',0,NULL,'');");
+        let second = read_history_chunk(&path, Some(cursor), 2).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|item| item.item.as_str())
+                .collect::<Vec<_>>(),
+            ["tie first", "old"]
+        );
+        assert!(second[0].searchable.contains("tie first test"));
+        let last = second.last().unwrap();
+        let cursor = HistoryCursor {
+            timestamp: last.cursor_ts.parse().unwrap(),
+            row_id: last.row_id,
+        };
+        assert!(
+            read_history_chunk(&path, Some(cursor), 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn missing_database_is_not_created() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.alfdb");
-        assert!(read_history(&path).is_err());
+        assert!(read_history_chunk(&path, None, 10).is_err());
         assert!(!path.exists());
     }
 
@@ -669,12 +890,25 @@ mod tests {
     }
 
     #[test]
-    fn number_shortcuts_follow_visible_rows_and_stop_at_end() {
-        assert_eq!(shortcut_index(14, 1, 20), Some(14));
-        assert_eq!(shortcut_index(14, 6, 20), Some(19));
-        assert_eq!(shortcut_index(14, 7, 20), None);
-        assert_eq!(shortcut_index(0, 0, 20), None);
-        assert_eq!(shortcut_index(0, 10, 20), None);
+    fn number_shortcuts_stay_on_first_nine_results() {
+        assert_eq!(shortcut_index(1, 20), Some(0));
+        assert_eq!(shortcut_index(9, 20), Some(8));
+        assert_eq!(shortcut_index(9, 8), None);
+        assert_eq!(shortcut_index(0, 20), None);
+        assert_eq!(shortcut_index(10, 20), None);
+    }
+
+    #[test]
+    fn shortcut_requires_more_than_85_percent_visible() {
+        assert!(sufficiently_visible(0, 0., 320.));
+        assert!(!sufficiently_visible(0, -36., 320.));
+        assert!(!sufficiently_visible(0, -5.4, 320.));
+        assert!(sufficiently_visible(0, -5.3, 320.));
+        assert!(!sufficiently_visible(8, 0., 318.6));
+        assert!(sufficiently_visible(8, 0., 318.7));
+        assert!(!sufficiently_visible(8, 0., 0.));
+        assert_eq!(initial_history_count(400.), 10);
+        assert_eq!(initial_history_count(450.), 11);
     }
 
     #[test]

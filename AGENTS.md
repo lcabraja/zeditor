@@ -29,7 +29,7 @@ macOS popup editor built with GPUI.
 - **Escape** — Collapse multi-cursors, then hide popup
 - **Cmd+Shift+V** — Open Alfred clipboard history in the focused popup
 - **Enter in history** — Insert the selected clip for editing
-- **Cmd+1–9 in history** — Insert the corresponding visible row
+- **Cmd+1–9 in history** — Insert one of the first nine search results, or scroll to it if not more than 85% visible
 - **Alt+Up/Down** — Move line up/down
 - **Alt+Shift+Up/Down** — Add cursor above/below
 

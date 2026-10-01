@@ -106,7 +106,9 @@ impl PopupEditor {
             window.focus(&history.read(cx).search.read(cx).focus_handle);
             return;
         }
-        let history = cx.new(ClipboardHistory::new);
+        let initial_count =
+            clipboard_history::initial_history_count(window.viewport_size().height.into());
+        let history = cx.new(|cx| ClipboardHistory::new(initial_count, cx));
         window.focus(&history.read(cx).search.read(cx).focus_handle);
         self.history_subscription =
             Some(
